@@ -215,7 +215,8 @@ fn forks_seals_cas_restart_and_snapshot() {
         },
     )
     .unwrap();
-    assert_eq!(s.collect(1001, 10, 10).unwrap().removed, 2);
+    assert_eq!(s.collect(1001, 10, 10).unwrap().removed, 0);
+    assert_eq!(s.collect(1011, 10, 10).unwrap().removed, 2);
 }
 #[test]
 fn leases_protect_future_arrivals_and_do_not_extend() {
@@ -1194,4 +1195,73 @@ fn collection_keeps_up_with_sustained_head_updates() {
         garbage.iter().all(|nodes| *nodes < 256),
         "garbage backlog: {garbage:?}"
     );
+}
+
+#[test]
+fn released_head_objects_receive_a_serving_grace_after_trie_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let runtime = db.runtime_store(limits()).unwrap();
+    runtime
+        .apply(
+            1,
+            RuntimeBatch {
+                objects: &[object(rk(1)), object(rk(2))],
+                heads: &[RuntimeHead {
+                    id: [1; 32],
+                    binding: [3; 32],
+                    parent: None,
+                    added: &[rk(1), rk(2)],
+                    removed: &[],
+                    metadata: &[],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    runtime
+        .apply(
+            1000,
+            RuntimeBatch {
+                heads: &[RuntimeHead {
+                    id: [2; 32],
+                    binding: [4; 32],
+                    parent: Some([1; 32]),
+                    added: &[],
+                    removed: &[rk(1)],
+                    metadata: &[],
+                }],
+                release_heads: &[[1; 32]],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .snapshot()
+            .unwrap()
+            .object(rk(1), None)
+            .unwrap()
+            .unwrap()
+            .seen,
+        1000
+    );
+    assert_eq!(
+        runtime
+            .snapshot()
+            .unwrap()
+            .object(rk(2), None)
+            .unwrap()
+            .unwrap()
+            .seen,
+        1
+    );
+    assert_eq!(runtime.collect(1001, 900, 10).unwrap().removed, 0);
+    assert_eq!(runtime.collect(1900, 900, 10).unwrap().removed, 1);
+    assert!(runtime
+        .snapshot()
+        .unwrap()
+        .object(rk(2), None)
+        .unwrap()
+        .is_some());
 }

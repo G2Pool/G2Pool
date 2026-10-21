@@ -609,14 +609,7 @@ impl Store {
             return Err(Error::Invalid("retire incumbent"));
         }
         self.runtime
-            .apply(
-                now(),
-                RuntimeBatch {
-                    release_heads: &[tip],
-                    expect_revision: Some(expected),
-                    ..Default::default()
-                },
-            )
+            .retire_head(now(), expected, tip)
             .map_err(runtime_error)?;
         Ok(())
     }

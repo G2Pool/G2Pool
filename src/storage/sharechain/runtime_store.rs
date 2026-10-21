@@ -5,6 +5,8 @@ use crate::storage::sharechain::{
 use heed::{types::Bytes, Database, Env, RoTxn, RwTxn, WithoutTls};
 use std::collections::BTreeSet;
 
+const OBJECT_HEADER_BYTES: usize = 1 + 4 + 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoutingKey {
     pub kind: u8,
@@ -266,6 +268,13 @@ impl RuntimeStore {
             .transpose()
             .map(|v| v.unwrap_or_default())
     }
+    fn seen(&self, tx: &RoTxn<'_, WithoutTls>, physical: &[u8]) -> Result<u64> {
+        num(Some(
+            self.db
+                .get(tx, &key(b't', physical))?
+                .ok_or(Error::Missing)?,
+        ))
+    }
     fn expire(&self, tx: &mut RwTxn<'_>, now: u64) -> Result<()> {
         let mut expired = Vec::new();
         for row in self.db.prefix_iter(tx, b"l")? {
@@ -322,6 +331,22 @@ impl RuntimeStore {
     }
     pub fn apply(&self, now: u64, batch: RuntimeBatch<'_>) -> Result<RuntimeRevision> {
         self.apply_with(now, batch, |_| Ok(()))
+    }
+
+    pub fn retire_head(&self, now: u64, expected: RuntimeRevision, id: Id) -> Result<()> {
+        let mut tx = self.env.write_txn()?;
+        self.apply_in(
+            &mut tx,
+            now,
+            RuntimeBatch {
+                release_heads: &[id],
+                expect_revision: Some(expected),
+                ..Default::default()
+            },
+            false,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn apply_with(
@@ -421,11 +446,13 @@ impl RuntimeStore {
             let pk = key(b'o', &physical);
             let mut value = vec![1];
             value.extend(object.format.to_be_bytes());
-            value.extend(now.to_be_bytes());
             value.extend(d);
             value.extend(object.bytes);
             if let Some(old) = self.db.get(tx, &pk)? {
-                if old.len() < 45 || old[1..5] != value[1..5] || old[45..] != value[45..] {
+                if old.len() < OBJECT_HEADER_BYTES
+                    || old[1..5] != value[1..5]
+                    || old[OBJECT_HEADER_BYTES..] != value[OBJECT_HEADER_BYTES..]
+                {
                     return Err(Error::Invalid("runtime physical collision"));
                 }
                 if mode == 1 {
@@ -465,6 +492,7 @@ impl RuntimeStore {
             }
             self.db.put(tx, &mk, &[mode])?;
             self.db.put(tx, &pk, &value)?;
+            self.db.put(tx, &key(b't', &physical), &now.to_be_bytes())?;
             self.db.put(tx, &key(b'p', &rk), &d)?;
         }
         for replacement in batch.replacements {
@@ -482,7 +510,10 @@ impl RuntimeStore {
             let mut old_key = key(b'o', &route);
             old_key.extend(replacement.expected_digest);
             let old = self.db.get(tx, &old_key)?.ok_or(Error::Missing)?;
-            if old.len() < 45 || old[0] != 1 || old[13..45] != replacement.expected_digest {
+            if old.len() < OBJECT_HEADER_BYTES
+                || old[0] != 1
+                || old[5..OBJECT_HEADER_BYTES] != replacement.expected_digest
+            {
                 return Err(Error::Invalid("runtime replacement encoding"));
             }
             if u32::from_be_bytes(old[1..5].try_into().unwrap()) != replacement.expected_format {
@@ -491,12 +522,11 @@ impl RuntimeStore {
             if replacement.bytes.len() as u64 > self.limits.max_object_bytes {
                 return Err(Error::Quota("runtime object quota"));
             }
-            let seen = old[5..13].to_vec();
+            let seen = self.seen(tx, &old_key[1..])?;
             let old_len = old.len() as u64;
             let physical = digest(replacement.bytes);
             let mut value = vec![1];
             value.extend(replacement.format.to_be_bytes());
-            value.extend(seen);
             value.extend(physical);
             value.extend(replacement.bytes);
             let mut new_key = key(b'o', &route);
@@ -512,7 +542,10 @@ impl RuntimeStore {
                 return Err(Error::Quota("runtime object quota"));
             }
             self.db.delete(tx, &old_key)?;
+            self.db.delete(tx, &key(b't', &old_key[1..]))?;
             self.db.put(tx, &new_key, &value)?;
+            self.db
+                .put(tx, &key(b't', &new_key[1..]), &seen.to_be_bytes())?;
             self.db.put(tx, &seal, &physical)?;
             self.db.put(tx, &key(b'p', &route), &physical)?;
         }
@@ -608,6 +641,11 @@ impl RuntimeStore {
             }
             self.db.put(tx, &sk, d)?;
         }
+        let mut released: BTreeSet<RoutingKey> = batch
+            .heads
+            .iter()
+            .flat_map(|head| head.removed.iter().copied())
+            .collect();
         for head in batch.heads {
             if head.metadata.len() > 4096 {
                 return Err(Error::Invalid("runtime head metadata"));
@@ -697,6 +735,15 @@ impl RuntimeStore {
                 usize::MAX / 64,
             )?;
             if old_binding.is_some_and(|old| old != head.binding) {
+                released.extend(
+                    self.trie
+                        .resolve(tx, &old_binding.unwrap())?
+                        .into_iter()
+                        .map(|k| RoutingKey {
+                            kind: k.kind,
+                            id: k.id,
+                        }),
+                );
                 self.trie.apply(
                     tx,
                     &DependencyBatch {
@@ -717,6 +764,15 @@ impl RuntimeStore {
                     return Err(Error::Invalid("runtime head"));
                 }
                 let binding: Id = value[8..].try_into().unwrap();
+                released.extend(
+                    self.trie
+                        .resolve(tx, &binding)?
+                        .into_iter()
+                        .map(|k| RoutingKey {
+                            kind: k.kind,
+                            id: k.id,
+                        }),
+                );
                 self.trie.apply(
                     tx,
                     &DependencyBatch {
@@ -728,6 +784,34 @@ impl RuntimeStore {
                 self.db.delete(tx, &key(b'h', id))?;
                 self.db.delete(tx, &key(b'j', id))?;
             }
+        }
+        let mut kept = BTreeSet::new();
+        for head in batch.heads {
+            kept.extend(
+                self.trie
+                    .resolve(tx, &head.binding)?
+                    .into_iter()
+                    .map(|k| RoutingKey {
+                        kind: k.kind,
+                        id: k.id,
+                    }),
+            );
+        }
+        for routing in released.difference(&kept).copied() {
+            let Some(seal) = self.db.get(tx, &key(b's', &routing.bytes()))? else {
+                continue;
+            };
+            let mut physical = routing.bytes();
+            physical.extend(seal);
+            let Some(value) = self.db.get(tx, &key(b'o', &physical))? else {
+                return Err(Error::Missing);
+            };
+            if value.len() < OBJECT_HEADER_BYTES {
+                return Err(Error::Invalid("runtime physical encoding"));
+            }
+            let released_at = now.max(self.seen(tx, &physical)?);
+            self.db
+                .put(tx, &key(b't', &physical), &released_at.to_be_bytes())?;
         }
         let mut heads = 0u64;
         for row in self.db.prefix_iter(tx, b"h")? {
@@ -843,7 +927,6 @@ impl RuntimeStore {
             return Ok(RuntimeGc::default());
         }
         let mut tx = self.env.write_txn()?;
-        let previous_bytes = self.budget.used(&tx)?;
         self.expire(&mut tx, now)?;
         self.trie.drain_gc(&mut tx, usize::MAX)?;
         let cursor = self.db.get(&tx, b"GC-CURSOR")?.map(ToOwned::to_owned);
@@ -854,23 +937,36 @@ impl RuntimeStore {
             .db
             .range(&tx, &(start, Bound::Excluded(b"p".as_slice())))?
             .take(limit)
-            .map(|r| r.map(|(k, v)| (k.to_vec(), v.len(), v[..v.len().min(45)].to_vec())))
+            .map(|r| {
+                r.map(|(k, v)| {
+                    (
+                        k.to_vec(),
+                        v.len(),
+                        v[..v.len().min(OBJECT_HEADER_BYTES)].to_vec(),
+                    )
+                })
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut stats = RuntimeGc::default();
         let mut count = num(self.db.get(&tx, b"COUNT")?)?;
         let mut bytes = num(self.db.get(&tx, b"BYTES")?)?;
         for (k, physical_len, v) in &rows {
             stats.examined += 1;
-            if k.len() != 66 || v.len() < 45 || v[0] != 1 || v[13..45] != k[34..] {
+            if k.len() != 66
+                || v.len() < OBJECT_HEADER_BYTES
+                || v[0] != 1
+                || v[5..OBJECT_HEADER_BYTES] != k[34..]
+            {
                 return Err(Error::Invalid("runtime physical encoding"));
             }
             let routing = RoutingKey::decode(&k[1..34])?;
-            let seen = num(Some(&v[5..13]))?;
+            let seen = self.seen(&tx, &k[1..])?;
             if now.checked_sub(seen).is_some_and(|age| age >= min_age)
                 && !keep.contains(&routing)
                 && !self.protected(&tx, routing, now, k[34..].try_into().unwrap())?
             {
                 self.db.delete(&mut tx, k)?;
+                self.db.delete(&mut tx, &key(b't', &k[1..]))?;
                 count = count
                     .checked_sub(1)
                     .ok_or(Error::Invalid("runtime count underflow"))?;
@@ -907,8 +1003,6 @@ impl RuntimeStore {
         }
         self.db.put(&mut tx, b"COUNT", &count.to_be_bytes())?;
         self.db.put(&mut tx, b"BYTES", &bytes.to_be_bytes())?;
-        self.budget
-            .check(&tx, previous_bytes, super::WRITE_RESERVE)?;
         tx.commit()?;
         Ok(stats)
     }
@@ -1079,7 +1173,11 @@ impl RuntimeReader<'_> {
             .take(bound)
             .map(|row| {
                 let (k, v) = row?;
-                if k.len() != 66 || v.len() < 45 || v[0] != 1 || v[13..45] != k[34..] {
+                if k.len() != 66
+                    || v.len() < OBJECT_HEADER_BYTES
+                    || v[0] != 1
+                    || v[5..OBJECT_HEADER_BYTES] != k[34..]
+                {
                     return Err(Error::Invalid("runtime physical encoding"));
                 }
                 Ok((
@@ -1087,8 +1185,8 @@ impl RuntimeReader<'_> {
                     RuntimeVariant {
                         digest: k[34..].try_into().unwrap(),
                         format: u32::from_be_bytes(v[1..5].try_into().unwrap()),
-                        seen: num(Some(&v[5..13]))?,
-                        byte_len: (v.len() - 45) as u64,
+                        seen: self.store.seen(self.txn, &k[1..])?,
+                        byte_len: (v.len() - OBJECT_HEADER_BYTES) as u64,
                     },
                 ))
             })
@@ -1124,14 +1222,18 @@ impl RuntimeReader<'_> {
             .take(bound)
             .map(|row| {
                 let (k, v) = row?;
-                if k.len() != 66 || v.len() < 45 || v[0] != 1 || v[13..45] != k[34..] {
+                if k.len() != 66
+                    || v.len() < OBJECT_HEADER_BYTES
+                    || v[0] != 1
+                    || v[5..OBJECT_HEADER_BYTES] != k[34..]
+                {
                     return Err(Error::Invalid("runtime physical encoding"));
                 }
                 Ok(RuntimeVariant {
                     digest: k[34..].try_into().unwrap(),
                     format: u32::from_be_bytes(v[1..5].try_into().unwrap()),
-                    seen: num(Some(&v[5..13]))?,
-                    byte_len: (v.len() - 45) as u64,
+                    seen: self.store.seen(self.txn, &k[1..])?,
+                    byte_len: (v.len() - OBJECT_HEADER_BYTES) as u64,
                 })
             })
             .collect()
@@ -1156,15 +1258,15 @@ impl RuntimeReader<'_> {
             .db
             .get(self.txn, &key(b'o', &p))?
             .map(|v| {
-                if v.len() < 45 || v[0] != 1 || v[13..45] != d {
+                if v.len() < OBJECT_HEADER_BYTES || v[0] != 1 || v[5..OBJECT_HEADER_BYTES] != d {
                     return Err(Error::Invalid("runtime object"));
                 }
                 Ok(StoredObject {
                     digest: d,
                     logical_digest,
                     format: u32::from_be_bytes(v[1..5].try_into().unwrap()),
-                    seen: num(Some(&v[5..13]))?,
-                    bytes: v[45..].to_vec(),
+                    seen: self.store.seen(self.txn, &p)?,
+                    bytes: v[OBJECT_HEADER_BYTES..].to_vec(),
                 })
             })
             .transpose()
