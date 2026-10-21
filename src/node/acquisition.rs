@@ -139,7 +139,7 @@ impl Node {
             let deadline = self
                 .store
                 .acquire(tip, &BTreeSet::new(), self.limits.facts)?;
-            let mut session = Session::new(tip, expected.anchor.clone(), self.profile.protocol);
+            let mut session = Session::new(tip, expected.anchor.clone(), self.profile.pool_id);
             if let Some((anchor, facts)) = &self.warm {
                 if *anchor == expected.anchor {
                     session.seed(facts);

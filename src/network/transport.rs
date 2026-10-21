@@ -1,17 +1,14 @@
 use super::{
     budget::Budgets,
-    codec::{Codec, Packet, Request, CONTROL, DEADLINE},
+    codec::{Codec, Packet, Request, CONTROL, DEADLINE, ENVELOPE},
     lock,
     wire::Message,
 };
-use crate::{
-    codec::{hash, Id},
-    node::Node,
-    Error, Result,
-};
+use crate::{codec::Id, node::Node, Error, Result};
 use libp2p::{
+    core::{upgrade, Transport},
     futures::StreamExt,
-    noise, ping, request_response as rpc,
+    noise, ping, pnet, request_response as rpc,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
@@ -36,42 +33,34 @@ struct Behaviour {
 }
 const MAX_YAMUX_STREAMS: usize = 12;
 fn swarm(
-    protocol: Id,
+    pool_id: Id,
+    pool_key: [u8; 32],
     budgets: Budgets,
     max_inbound: u32,
     bans: super::bans::IpBans,
 ) -> Result<Swarm<Behaviour>> {
-    let schema = hash(
-        "POOL_WIRE_SCHEMA",
-        b"heads;hello-port;peers;notice;ack;busy;get;partitioned-reply;typed-lengths;rolling-sharechain",
-    );
     let mut prologue = b"G2Pool transport\0".to_vec();
-    prologue.extend(protocol);
-    prologue.extend(schema);
-    let suffix: String = protocol
-        .iter()
-        .chain(schema.iter())
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let control = StreamProtocol::try_from_owned(format!("/g2pool/{suffix}/control"))
-        .map_err(|_| Error::Invalid("stream protocol"))?;
-    let bulk = StreamProtocol::try_from_owned(format!("/g2pool/{suffix}/objects"))
-        .map_err(|_| Error::Invalid("stream protocol"))?;
+    prologue.extend(pool_id);
+    let control = StreamProtocol::new("/g2pool/control");
+    let bulk = StreamProtocol::new("/g2pool/objects");
     Ok(SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            move |key: &libp2p::identity::Keypair| {
-                noise::Config::new(key).map(|config| config.with_prologue(prologue.clone()))
-            },
-            || {
-                let mut config = yamux::Config::default();
-                config.set_max_num_streams(MAX_YAMUX_STREAMS);
-                config.set_max_connection_receive_window(MAX_YAMUX_STREAMS * yamux::DEFAULT_CREDIT);
-                config
-            },
-        )
-        .map_err(|_| Error::Invalid("Noise transport"))?
+        .with_other_transport(move |key: &libp2p::identity::Keypair| {
+            let pnet = pnet::PnetConfig::new(pnet::PreSharedKey::new(pool_key));
+            let noise = noise::Config::new(key)?.with_prologue(prologue);
+            let mut mux = yamux::Config::default();
+            mux.set_max_num_streams(MAX_YAMUX_STREAMS);
+            mux.set_max_connection_receive_window(MAX_YAMUX_STREAMS * yamux::DEFAULT_CREDIT);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+                    .and_then(move |socket, _| pnet.handshake(socket))
+                    .upgrade(upgrade::Version::V1Lazy)
+                    .authenticate(noise)
+                    .multiplex(mux)
+                    .timeout(Duration::from_secs(10)),
+            )
+        })
+        .map_err(|_| Error::Invalid("pool transport"))?
         .with_behaviour(|key| Behaviour {
             control: rpc::Behaviour::with_codec(
                 Codec {
@@ -186,7 +175,8 @@ impl Handle {
         let ticket = pool
             .reserve(
                 ceiling
-                    .checked_mul(6)
+                    .checked_add(ENVELOPE)
+                    .and_then(|size| size.checked_mul(6))
                     .ok_or(Error::Capacity("network receive bytes"))?,
             )
             .ok_or(Error::Capacity("network receive bytes"))?;
@@ -280,10 +270,11 @@ pub(super) fn start(
     node: Arc<Mutex<Node>>,
     stop: Arc<AtomicBool>,
     max_inbound: usize,
+    pool_key: [u8; 32],
 ) -> Result<(Handle, thread::JoinHandle<Result<()>>)> {
-    let (protocol, bans) = {
+    let (pool_id, bans) = {
         let guard = lock(&node)?;
-        (guard.profile.protocol, guard.peers.bans.clone())
+        (guard.profile.pool_id, guard.peers.bans.clone())
     };
     let kind = super::chain_type(&node)?;
     let budgets = Budgets::default();
@@ -311,7 +302,8 @@ pub(super) fn start(
             .build()?;
         runtime.block_on(async move {
             let mut swarm = swarm(
-                protocol,
+                pool_id,
+                pool_key,
                 budgets,
                 max_inbound.min(crate::network::INBOUND_PEERS) as u32,
                 bans,
@@ -428,7 +420,7 @@ impl Manager {
                     if self.control.values().filter(|f| f.peer == peer).count() >= 4 {
                         continue;
                     }
-                    if let Some(ticket) = handle.budgets.control.reserve(CONTROL * 6) {
+                    if let Some(ticket) = handle.budgets.control.reserve((CONTROL + ENVELOPE) * 6) {
                         let id = swarm.behaviour_mut().control.send_request(
                             &peer,
                             Request {
@@ -905,7 +897,8 @@ fn handle_rpc(
                                 request
                                     .message
                                     .response_ceiling()?
-                                    .checked_mul(6)
+                                    .checked_add(ENVELOPE)
+                                    .and_then(|size| size.checked_mul(6))
                                     .ok_or(Error::Capacity("network serve bytes"))?,
                             )
                             .ok_or(Error::Capacity("network serve bytes"))?;
@@ -914,7 +907,7 @@ fn handle_rpc(
                             work,
                             serving,
                             ticket,
-                            guard.profile.manifest.network,
+                            guard.profile.network,
                         ))
                     })();
                     match prepared {
@@ -944,7 +937,7 @@ fn handle_rpc(
                             });
                         }
                         Err(Error::Capacity(_)) => {
-                            if let Some(ticket) = handle.budgets.control.reserve(1) {
+                            if let Some(ticket) = handle.budgets.control.reserve(1 + ENVELOPE) {
                                 let response = Packet::new(Message::Busy, ticket);
                                 let _ = swarm.behaviour_mut().bulk.send_response(channel, response);
                             }
@@ -1057,12 +1050,15 @@ fn handle_rpc(
             connection_id,
             ..
         } if live.get(&peer) == Some(&connection_id)
-            && super::codec::is_remote_protocol_error(&error) =>
+            && (super::codec::is_remote_protocol_error(&error)
+                || super::codec::is_incompatible_version(&error)) =>
         {
-            swarm
-                .behaviour_mut()
-                .admission
-                .ban_connection(connection_id);
+            if super::codec::is_remote_protocol_error(&error) {
+                swarm
+                    .behaviour_mut()
+                    .admission
+                    .ban_connection(connection_id);
+            }
             disconnect(swarm, peer);
         }
         _ => {}

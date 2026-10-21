@@ -14,7 +14,6 @@ fn encoding_plan_accepts_work_window_accounts_and_rejects_overflow() {
             })
             .collect();
         let plan = EncodingPlan {
-            protocol: [0; 32],
             entries: List(entries),
         };
         assert!(encode(&plan).is_ok());
@@ -26,7 +25,6 @@ fn encoding_plan_accepts_work_window_accounts_and_rejects_overflow() {
         })
         .collect();
     let plan = EncodingPlan {
-        protocol: [0; 32],
         entries: List(entries),
     };
     assert!(matches!(encode(&plan), Err(Error::Invalid("list ceiling"))));

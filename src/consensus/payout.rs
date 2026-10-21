@@ -105,7 +105,7 @@ impl<S: Source> Validator<'_, '_, S> {
             6
         } else {
             let auth = CouponAuth {
-                protocol: self.view.profile.protocol,
+                pool_id: self.view.profile.pool_id,
                 owner,
                 reward_id: id(&coupon.reward)?,
             };
@@ -195,7 +195,7 @@ impl<S: Source> Validator<'_, '_, S> {
                 .fields
                 .birth
                 .height
-                .checked_add(self.view.profile.manifest.lifetime)
+                .checked_add(self.view.profile.lifetime)
                 .ok_or(Error::Invalid("expiry overflow"))?;
             if !(r.fields.birth.height <= anchor.height && anchor.height < expires) {
                 return Err(Error::Invalid("registration expiry"));
@@ -345,7 +345,6 @@ impl<S: Source> Validator<'_, '_, S> {
         let reward = self
             .view
             .profile
-            .manifest
             .subsidy
             .checked_add(fees)
             .ok_or(Error::Invalid("reward overflow"))?;
@@ -354,7 +353,6 @@ impl<S: Source> Validator<'_, '_, S> {
             .ok_or(Error::Invalid("overpayment"))?;
         let financial = Financial {
             record: PayoutRecord {
-                protocol: self.view.profile.protocol,
                 anchor: anchor.clone(),
                 parent: parent.clone(),
                 receipts: List(receipts),

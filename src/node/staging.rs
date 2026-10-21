@@ -15,7 +15,7 @@ pub(crate) struct Stage {
 
 #[derive(Debug)]
 pub(crate) struct VerifiedStage {
-    protocol: Id,
+    pool_id: Id,
     anchor: Anchor,
     objects: Vec<Object>,
     checked_at: i64,
@@ -88,7 +88,7 @@ pub(super) fn verify<S: Source>(
             return Err(Error::Invalid("staged WorkID"));
         }
         let auth: WorkAuthorization = decode(&overlay.read(Key::new(Kind::Authorization, id))?)?;
-        work.authorize(&auth, view.profile.protocol)?;
+        work.authorize(&auth, view.profile.pool_id)?;
     }
     view.check()?;
     budget.check()
@@ -106,7 +106,7 @@ impl Stage {
         }
         verify(&source, &self.objects, &view, self.limits, self.cancel)?;
         Ok(VerifiedStage {
-            protocol: view.profile.protocol,
+            pool_id: view.profile.pool_id,
             anchor: view.head.clone(),
             objects: self.objects,
             checked_at: view.now,
@@ -142,7 +142,7 @@ impl Node {
         if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        if verified.protocol != self.profile.protocol
+        if verified.pool_id != self.profile.pool_id
             || view.head != verified.anchor
             || view.now < verified.checked_at
         {

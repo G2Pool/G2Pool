@@ -45,7 +45,7 @@ pub struct SharechainDb {
     runtime: Database<Bytes, Bytes>,
 }
 impl SharechainDb {
-    pub fn open(path: &Path, map_bytes: usize, protocol: Id) -> Result<Self> {
+    pub fn open(path: &Path, map_bytes: usize, pool_id: Id) -> Result<Self> {
         if map_bytes == 0 {
             return Err(Error::Invalid("zero storage limit"));
         }
@@ -65,19 +65,19 @@ impl SharechainDb {
         let runtime = env.create_database(&mut tx, Some("runtime_store"))?;
         let meta: Database<Bytes, Bytes> = env.create_database(&mut tx, Some("meta"))?;
         match meta.get(&tx, b"schema")? {
-            Some(b"rolling-sharechain") => {}
+            Some(b"pool-sharechain") => {}
             Some(_) => return Err(Error::Invalid("schema")),
-            None => meta.put(&mut tx, b"schema", b"rolling-sharechain")?,
+            None => meta.put(&mut tx, b"schema", b"pool-sharechain")?,
         }
-        match meta.get(&tx, b"protocol")? {
-            Some(previous) if previous != protocol.as_slice() => {
-                return Err(Error::Invalid("protocol"))
+        match meta.get(&tx, b"pool_id")? {
+            Some(previous) if previous != pool_id.as_slice() => {
+                return Err(Error::Invalid("pool identity mismatch"))
             }
             Some(previous) if previous.len() != 32 => {
-                return Err(Error::Invalid("protocol encoding"))
+                return Err(Error::Invalid("pool identity encoding"))
             }
             Some(_) => {}
-            None => meta.put(&mut tx, b"protocol", &protocol)?,
+            None => meta.put(&mut tx, b"pool_id", &pool_id)?,
         }
         tx.commit()?;
         let budget = budget::DatabaseBudget::new(env.clone(), map_bytes as u64);

@@ -83,7 +83,7 @@ impl Mining {
             .lock()
             .map_err(|_| Error::Invalid("node sequencer poisoned"))?;
         let native = guard.chain.clone();
-        let network = guard.profile.manifest.network;
+        let network = guard.profile.network;
         let published = guard.published.clone();
         let solutions = crate::mining::submission::Solutions::new(&guard.store);
         drop(guard);

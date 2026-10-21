@@ -7,7 +7,7 @@ fn locked_startup_creates_one_grin_seed_and_never_replaces_a_missing_seed() {
     let dir = tempfile::tempdir().unwrap();
     let lock = open_node_lock(dir.path()).unwrap();
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
-    require_new_wallet_directory(dir.path()).unwrap();
+    fs::write(dir.path().join("private.json"), b"unrelated configuration").unwrap();
     let wallet = initialize_wallet(dir.path(), &lock, false, Offline).unwrap();
     let account = wallet.signer().unwrap().account();
     let path = crate::wallet::seed_path(dir.path());
@@ -28,7 +28,6 @@ fn locked_startup_creates_one_grin_seed_and_never_replaces_a_missing_seed() {
     drop(wallet);
     fs::remove_file(&path).unwrap();
     assert!(initialize_wallet(dir.path(), &lock, true, Offline).is_err());
-    assert!(require_new_wallet_directory(dir.path()).is_err());
     assert!(!path.exists());
 }
 #[test]
@@ -76,32 +75,6 @@ fn config(arguments: &[&str]) -> Config {
         .try_get_matches_from(std::iter::once("g2pool").chain(arguments.iter().copied()))
         .unwrap();
     crate::cli::config(&matches).unwrap()
-}
-#[test]
-fn source_bootstrap_defaults_use_the_remote_network_port() {
-    for (network, port) in [("mainnet", 3417), ("testnet", 13417)] {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().to_str().unwrap();
-        let selected = config(&[
-            "--data-dir",
-            data,
-            "--network",
-            network,
-            "--pool-listen",
-            "0.0.0.0:5550",
-        ]);
-        let defaults = bootstrap_peers(&selected);
-        assert_eq!(
-            defaults,
-            vec![
-                SocketAddr::new("188.119.24.7".parse().unwrap(), port),
-                SocketAddr::new("51.83.197.245".parse().unwrap(), port),
-            ]
-        );
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-    assert_eq!(config(&[]).network, ChainTypes::Mainnet);
-    assert_eq!(bootstrap_peers(&config(&["--network", "mainnet"])).len(), 2);
 }
 #[test]
 fn instance_settings_are_selected_by_directory_and_explicit_ports_override() {

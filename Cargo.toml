@@ -21,7 +21,7 @@ clap = { version = "4.6.7", default-features = false, features = ["std", "help",
 directories = "6.0.0"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 tokio = { version = "1.53.3", features = ["sync", "macros", "rt", "time"] }
-libp2p = { version = "=0.57.1", default-features = false, features = ["tcp", "tokio", "noise", "yamux", "request-response", "ping", "ed25519", "macros"] }
+libp2p = { version = "=0.57.1", default-features = false, features = ["tcp", "tokio", "noise", "yamux", "request-response", "ping", "ed25519", "macros", "pnet"] }
 fs2 = "0.4.3"
 grin_chain = "=5.5.2"
 grin_core = "=5.5.2"
@@ -33,6 +33,7 @@ rand = "0.10.3"
 heed = "=0.22.1"
 thiserror = "2.0.21"
 serde = { version = "1.0.229", features = ["derive"] }
+semver = "1.0.28"
 serde_json = "1.0.154"
 anyhow = "1.0.104"
 

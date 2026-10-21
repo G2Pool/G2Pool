@@ -22,7 +22,6 @@ fn quota_errors_are_retryable_without_hiding_corrupt_metadata_or_database_errors
 }
 fn inventory() -> Object {
     Object::content(&Inventory {
-        protocol: [1; 32],
         owner: [2; 33],
         rows: List(Vec::new()),
     })
@@ -32,10 +31,7 @@ fn auth(key: Key, signature: u8) -> Object {
     Object::new(
         key,
         encode(&WorkAuthorization {
-            fields: WorkAuthMessage {
-                protocol: [1; 32],
-                work_id: key.id,
-            },
+            fields: WorkAuthMessage { work_id: key.id },
             signature: [signature; 64],
         })
         .unwrap(),
@@ -115,7 +111,6 @@ fn winning_disconnected_head_replaces_only_the_incumbent_at_capacity() {
         anchor: anchor.clone(),
         financial: crate::consensus::Financial {
             record: PayoutRecord {
-                protocol: [1; 32],
                 anchor: anchor.clone(),
                 parent: Parent::Root(anchor.clone()),
                 receipts: List(vec![]),
@@ -204,4 +199,25 @@ impl Store {
         }
         self.stage_checked(objects)
     }
+}
+
+#[test]
+fn different_pool_or_regenerated_alpha_cannot_rebind_existing_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom = serde_json::json!({"name":"private", "key":"42".repeat(32), "bootstrap_peers":{"mainnet":[],"testnet":[]}});
+    crate::secure_file::publish_atomic(
+        &dir.path().join("pool.json"),
+        &serde_json::to_vec(&custom).unwrap(),
+        false,
+    )
+    .unwrap();
+    let custom = crate::pool::Pool::load(dir.path(), None).unwrap();
+    let path = dir.path().join("pool");
+    let store = Store::open(&path, custom.id([1; 32]), StorageLimits::default()).unwrap();
+    drop(store);
+    std::fs::remove_file(dir.path().join("pool.json")).unwrap();
+    let alpha = crate::pool::Pool::load(dir.path(), None).unwrap();
+    assert!(Store::open(&path, alpha.id([1; 32]), StorageLimits::default()).is_err());
+    assert!(Store::open(&path, custom.id([2; 32]), StorageLimits::default()).is_err());
+    assert!(Store::open(&path, custom.id([1; 32]), StorageLimits::default()).is_ok());
 }

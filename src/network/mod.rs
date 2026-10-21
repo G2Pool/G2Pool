@@ -37,7 +37,7 @@ fn lock(node: &Arc<Mutex<Node>>) -> Result<std::sync::MutexGuard<'_, Node>> {
         .map_err(|_| Error::Invalid("node sequencer poisoned"))
 }
 fn chain_type(node: &Arc<Mutex<Node>>) -> Result<grin_core::global::ChainTypes> {
-    match lock(node)?.profile.manifest.network {
+    match lock(node)?.profile.network {
         0 => Ok(grin_core::global::ChainTypes::Mainnet),
         1 => Ok(grin_core::global::ChainTypes::Testnet),
         2 => Ok(grin_core::global::ChainTypes::AutomatedTesting),
@@ -61,14 +61,15 @@ pub fn start(
     node: Arc<Mutex<Node>>,
     stop: Arc<AtomicBool>,
     max_sessions: usize,
+    pool_key: [u8; 32],
 ) -> Result<thread::JoinHandle<Result<()>>> {
-    let (handle, worker) = transport::start(address, node.clone(), stop, max_sessions)?;
+    let (handle, worker) = transport::start(address, node.clone(), stop, max_sessions, pool_key)?;
     lock(&node)?.transport = Some(handle);
     Ok(worker)
 }
 pub struct Client {
     address: SocketAddr,
-    protocol: Id,
+    pool_id: Id,
     handle: Option<transport::Handle>,
     initialized: bool,
     last_heads: Instant,
@@ -83,10 +84,10 @@ impl Drop for Client {
     }
 }
 impl Client {
-    pub fn new(address: SocketAddr, protocol: Id) -> Self {
+    pub fn new(address: SocketAddr, pool_id: Id) -> Self {
         Self {
             address: normalize(address),
-            protocol,
+            pool_id,
             handle: None,
             initialized: false,
             generation: None,
@@ -105,8 +106,8 @@ impl Client {
         stop: &AtomicBool,
         turns: usize,
     ) -> Result<usize> {
-        if lock(node)?.profile.protocol != self.protocol {
-            return Err(Error::Invalid("client protocol"));
+        if lock(node)?.profile.pool_id != self.pool_id {
+            return Err(Error::Invalid("client pool identity"));
         }
         if self.handle.is_none() {
             self.handle = lock(node)?.transport.clone();

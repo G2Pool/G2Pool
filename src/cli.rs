@@ -7,6 +7,7 @@ pub(crate) fn command() -> Command {
         .about("P2Pool implementation for Grin")
         .arg(Arg::new("network").long("network").global(true).value_parser(["mainnet", "testnet"]).default_value("mainnet"))
         .arg(Arg::new("data-dir").long("data-dir").global(true).value_parser(clap::value_parser!(PathBuf)))
+        .arg(Arg::new("pool").long("pool").value_parser(clap::value_parser!(PathBuf)).help("Pool definition file (default: <data-dir>/pool.json)"))
         .arg(Arg::new("stratum").long("stratum").value_parser(clap::value_parser!(SocketAddr)))
         .arg(Arg::new("pool-listen").long("pool-listen").value_parser(clap::value_parser!(SocketAddr)))
         .arg(Arg::new("grin-listen").long("grin-listen").value_parser(clap::value_parser!(SocketAddr)))
@@ -30,6 +31,7 @@ pub(crate) fn config(matches: &ArgMatches) -> crate::Result<daemon::Config> {
     daemon::Config::load(
         base(matches),
         network(matches),
+        matches.get_one::<PathBuf>("pool").cloned(),
         matches.get_one::<SocketAddr>("stratum").copied(),
         matches.get_one::<SocketAddr>("pool-listen").copied(),
         matches.get_one::<SocketAddr>("grin-listen").copied(),
@@ -38,11 +40,11 @@ pub(crate) fn config(matches: &ArgMatches) -> crate::Result<daemon::Config> {
 pub fn run() -> anyhow::Result<()> {
     let matches = command().get_matches();
     if matches.subcommand_name().is_some()
-        && ["stratum", "pool-listen", "grin-listen"]
+        && ["stratum", "pool-listen", "grin-listen", "pool"]
             .iter()
             .any(|arg| matches.contains_id(arg))
     {
-        anyhow::bail!("listener options apply only when starting the daemon");
+        anyhow::bail!("pool and listener options apply only when starting the daemon");
     }
     let data = crate::network_data_dir(
         base(&matches),

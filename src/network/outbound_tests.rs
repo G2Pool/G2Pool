@@ -15,8 +15,16 @@ impl Servers {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::from(ip), 0)).unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        self.workers
-            .push(super::super::start(address, node, self.stop.clone(), 4).unwrap());
+        self.workers.push(
+            super::super::start(
+                address,
+                node,
+                self.stop.clone(),
+                4,
+                crate::pool::Pool::alpha().key(),
+            )
+            .unwrap(),
+        );
         address
     }
 }
@@ -186,15 +194,15 @@ fn transport_rejects_stale_candidate_generations_before_retiring_the_old_connect
     let (left, _left_signer, _left_wallet, _left_dir) = crate::node::tests::setup();
     let (mut right, right_signer, right_wallet, _right_dir) = crate::node::tests::setup();
     crate::node::tests::share(&mut right, &right_signer, &right_wallet);
-    let protocol = left.profile.protocol;
+    let pool_id = left.profile.pool_id;
     let left = Arc::new(Mutex::new(left));
     let right = Arc::new(Mutex::new(right));
     let mut servers = Servers::new();
     servers.start(left.clone(), [127, 0, 0, 1]);
     let previous = servers.start(right.clone(), [127, 42, 1, 1]);
     let candidate = servers.start(right, [127, 42, 1, 2]);
-    let mut old = Client::new(previous, protocol);
-    let mut new = Client::new(candidate, protocol);
+    let mut old = Client::new(previous, pool_id);
+    let mut new = Client::new(candidate, pool_id);
     old.synchronize_turns(&left, &servers.stop, 0).unwrap();
     assert!(old.verified_connection(&left).unwrap().is_none());
     old.last_heads = Instant::now() - Duration::from_secs(30);
@@ -229,14 +237,14 @@ fn cancelled_first_request_does_not_leave_an_unowned_connection() {
     let (left, _left_signer, _left_wallet, _left_dir) = crate::node::tests::setup();
     let (mut right, _right_signer, _right_wallet, _right_dir) = crate::node::tests::setup();
     right.peers = super::super::peers::Book::memory(true);
-    let protocol = left.profile.protocol;
+    let pool_id = left.profile.pool_id;
     let left = Arc::new(Mutex::new(left));
     let right = Arc::new(Mutex::new(right));
     let mut servers = Servers::new();
     servers.start(left.clone(), [127, 0, 0, 1]);
     let address = servers.start(right.clone(), [127, 42, 2, 1]);
     let transport = lock(&left).unwrap().transport.clone().unwrap();
-    let mut client = Client::new(address, protocol);
+    let mut client = Client::new(address, pool_id);
     client.handle = Some(transport.clone());
     assert!(matches!(
         client.request(
@@ -263,13 +271,13 @@ fn valid_ancestor_and_empty_state_qualify_but_unknown_history_does_not() {
     let (left, _left_signer, _left_wallet, _left_dir) = crate::node::tests::setup();
     let (mut right, right_signer, right_wallet, _right_dir) = crate::node::tests::setup();
     let (ancestor, _) = crate::node::tests::share(&mut right, &right_signer, &right_wallet);
-    let protocol = left.profile.protocol;
+    let pool_id = left.profile.pool_id;
     let left = Arc::new(Mutex::new(left));
     let right = Arc::new(Mutex::new(right));
     let mut servers = Servers::new();
     servers.start(left.clone(), [127, 0, 0, 1]);
     let address = servers.start(right.clone(), [127, 44, 0, 1]);
-    let mut client = Client::new(address, protocol);
+    let mut client = Client::new(address, pool_id);
     client.synchronize(&left, &servers.stop).unwrap();
     assert!(client.verified_connection(&left).unwrap().is_some());
     let observed = client.observed_heads.clone();

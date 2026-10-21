@@ -111,7 +111,7 @@ pub(crate) fn expand(bytes: &[u8], view: &View<'_>) -> Result<Vec<u8>> {
         return Err(Error::Invalid("local format"));
     }
     let job: Job = decode(&local.job.0)?;
-    if job.protocol != view.profile.protocol {
+    if job.pool_id != view.profile.pool_id {
         return Err(Error::Invalid("local profile"));
     }
     let parent = view.anchor(&job.anchor)?;
@@ -130,7 +130,7 @@ pub(crate) fn expand(bytes: &[u8], view: &View<'_>) -> Result<Vec<u8>> {
         output_root: grin_core::core::hash::Hash::from_vec(&local.output_root),
         range_proof_root: grin_core::core::hash::Hash::from_vec(&local.range_root),
         kernel_root: grin_core::core::hash::Hash::from_vec(&local.kernel_root),
-        total_kernel_offset: BlindingFactor::from_slice(&scalar(job.protocol, id(&job)?)?),
+        total_kernel_offset: BlindingFactor::from_slice(&scalar(id(&job)?)?),
         output_mmr_size: size(
             parent
                 .output_mmr_count()

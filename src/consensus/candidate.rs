@@ -6,15 +6,12 @@ impl<S: Source> Validator<'_, '_, S> {
     pub fn full_check(&mut self, id: Id) -> Result<Block> {
         let work = self.work(id)?;
         self.parent(&work)?;
-        if work.job.uncles.0.len() > usize::from(self.view.profile.manifest.max_uncles) {
+        if work.job.uncles.0.len() > usize::from(self.view.profile.max_uncles) {
             return Err(Error::Invalid("too many uncles"));
         }
         self.uncles(&work)?;
         self.registration(&work)?;
         let tx_object: TxOnly = self.object(work.job.transaction_only)?;
-        if tx_object.protocol != work.job.protocol {
-            return Err(Error::Invalid("transaction protocol"));
-        }
         let tx: Transaction = native::parse(&tx_object.native.0)?;
         if tx.outputs().iter().any(|o| o.is_coinbase())
             || tx.kernels().iter().any(|k| k.is_coinbase())
@@ -41,9 +38,6 @@ impl<S: Source> Validator<'_, '_, S> {
         if financial.record.finder != work.job.finder_value {
             return Err(Error::Invalid("finder allocation"));
         }
-        if output.protocol != work.job.protocol {
-            return Err(Error::Invalid("finder protocol"));
-        }
         let finder: grin_core::core::Output = native::parse(&output.output.0)?;
         if finder.commitment().0 != work.job.finder_commitment
             || !finder.is_coinbase()
@@ -53,9 +47,6 @@ impl<S: Source> Validator<'_, '_, S> {
                 .any(|(_, o, _)| o.commitment() == finder.commitment())
         {
             return Err(Error::Invalid("finder output"));
-        }
-        if residual.protocol != work.job.protocol {
-            return Err(Error::Invalid("residual protocol"));
         }
         let finder_kernel: TxKernel = native::parse(&residual.finder_kernel.0)?;
         if !finder_kernel.is_coinbase() {
@@ -75,14 +66,13 @@ impl<S: Source> Validator<'_, '_, S> {
             return Err(Error::Invalid("finder kernel excess"));
         }
         drop(secp);
-        if encoding.protocol != work.job.protocol
-            || encoding
-                .entries
-                .0
-                .windows(2)
-                .any(|w| w[0].account >= w[1].account)
+        if encoding
+            .entries
+            .0
+            .windows(2)
+            .any(|w| w[0].account >= w[1].account)
         {
-            return Err(Error::Invalid("encoding order/protocol"));
+            return Err(Error::Invalid("encoding order"));
         }
         let mut groups: BTreeMap<Point, Vec<TxKernel>> = BTreeMap::new();
         for (owner, _, k) in &financial.coupons {
@@ -110,7 +100,6 @@ impl<S: Source> Validator<'_, '_, S> {
                         .ok_or(Error::Invalid("missing aggregate"))?;
                     aggregate_index += 1;
                     let object = Kernel {
-                        protocol: work.job.protocol,
                         native: bytes.clone(),
                     };
                     if crate::codec::id(&object)? != *cid {
@@ -133,7 +122,7 @@ impl<S: Source> Validator<'_, '_, S> {
         }
         let parent = self.view.anchor(&work.job.anchor)?;
         let binding: TxKernel = native::parse(&residual.binding_kernel.0)?;
-        let m = scalar(work.job.protocol, crate::codec::id(&work.job)?)?;
+        let m = scalar(crate::codec::id(&work.job)?)?;
         let handle = static_secp_instance();
         let secp = handle.lock();
         let m = secp::key::SecretKey::from_slice(&secp, &m).unwrap();

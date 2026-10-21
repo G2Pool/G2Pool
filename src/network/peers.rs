@@ -198,11 +198,11 @@ impl Book {
     }
     pub fn open_store(
         store: &crate::storage::Store,
-        protocol: Id,
+        pool_id: Id,
         local: bool,
         seeds: &[SocketAddr],
     ) -> Result<Self> {
-        if store.protocol() != protocol {
+        if store.pool_id() != pool_id {
             return Err(Error::Invalid("peer database identity"));
         }
         Self::from_database(store.database(), local, seeds)

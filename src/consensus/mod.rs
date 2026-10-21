@@ -390,12 +390,12 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
                 .checked_add(1)
                 .ok_or(Error::Invalid("height overflow"))?,
             &history,
-            u64::from(self.view.profile.manifest.share_target_seconds),
+            u64::from(self.view.profile.share_target_seconds),
         )
     }
     fn require_history(&mut self, parent: &Parent) -> Result<()> {
         let window = self.view.profile.work_window_limit();
-        let mut primary = window + usize::from(self.view.profile.manifest.uncle_depth);
+        let mut primary = window + usize::from(self.view.profile.uncle_depth);
         let mut uncles = window;
         let mut cursor = parent.clone();
         let mut visited = Vec::new();
@@ -451,7 +451,7 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
                 > self
                     .view
                     .now
-                    .saturating_add(i64::from(self.view.profile.manifest.future_seconds))
+                    .saturating_add(i64::from(self.view.profile.future_seconds))
             {
                 return Err(Error::Future);
             }
@@ -464,7 +464,7 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
         }
         let auth: WorkAuthorization =
             decode(&authorization).map_err(|_| Error::Witness("work authorization encoding"))?;
-        core.authorize(&auth, self.view.profile.protocol)?;
+        core.authorize(&auth, self.view.profile.pool_id)?;
         let core = Arc::new(core);
         self.facts.work_bytes += core.retained_bytes();
         self.facts.work.insert(id, core.clone());
@@ -535,7 +535,7 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
             .map(|(evaluation, _)| evaluation)
     }
     pub(crate) fn evaluate_with_facts(self, tip: Id) -> Result<(Evaluation, Facts)> {
-        let mut session = Session::new(tip, self.view.head.clone(), self.view.profile.protocol);
+        let mut session = Session::new(tip, self.view.head.clone(), self.view.profile.pool_id);
         session.inherit_topology(self.facts.topology.clone());
         let mut validator = self;
         loop {

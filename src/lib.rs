@@ -16,6 +16,8 @@ pub mod network;
 #[doc(hidden)]
 pub mod node;
 pub mod objects;
+pub mod pool;
+
 pub mod secure_file;
 #[doc(hidden)]
 pub mod status;
@@ -23,6 +25,9 @@ pub mod status;
 pub mod storage;
 #[doc(hidden)]
 pub mod wallet;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const MIN_PEER_VERSION: &str = "0.1.0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

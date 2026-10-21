@@ -191,14 +191,14 @@ fn reachability_does_not_make_a_sparse_peer_a_productive_gossip_source() {
 impl Book {
     fn open(
         path: std::path::PathBuf,
-        protocol: Id,
+        pool_id: Id,
         local: bool,
         seeds: &[SocketAddr],
     ) -> Result<Self> {
         let sharechain = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
             crate::storage::sharechain::MAP_BYTES,
-            protocol,
+            pool_id,
         )
         .map_err(|_| Error::Invalid("peer database identity"))?;
         Self::from_database(sharechain, local, seeds)

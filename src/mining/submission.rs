@@ -382,7 +382,7 @@ fn material(template: &Template, wallet: &Signer, block: &Block) -> Result<Vec<O
         Object::new(Key::new(Kind::Core, id), codec::encode(&core)?)?,
         Object::new(
             Key::new(Kind::Authorization, id),
-            codec::encode(&wallet.authorize(template.job.protocol, id)?)?,
+            codec::encode(&wallet.authorize(id)?)?,
         )?,
         Object::new(
             Key::new(Kind::Residual, id),

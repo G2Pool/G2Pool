@@ -153,14 +153,14 @@ impl Connections {
         inbound: Option<ConnectionId>,
     ) -> Result<()> {
         let kind = chain_type(&self.node)?;
-        let protocol = lock(&self.node)?.profile.protocol;
+        let pool_id = lock(&self.node)?.profile.pool_id;
         let node = self.node.clone();
         let ready = self.send.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let signal = stop.clone();
         let worker = thread::spawn(move || {
             grin_core::global::set_local_chain_type(kind);
-            let mut client = Client::new(address, protocol);
+            let mut client = Client::new(address, pool_id);
             client.inbound = inbound;
             client.generation = inbound;
             let mut announced = false;

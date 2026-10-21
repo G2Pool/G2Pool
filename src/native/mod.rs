@@ -1,8 +1,6 @@
 mod profile;
 pub(crate) use profile::MAX_ANCHOR_TIMESTAMP_DEVIATION;
-pub use profile::{
-    default_limits, manifest, payout_precision, Profile, NATIVE_CODEC, NATIVE_VERSION,
-};
+pub use profile::{payout_precision, Profile, NATIVE_CODEC};
 
 use crate::{codec::*, Error, Result};
 use grin_chain::{pipe, txhashset, Chain};
@@ -77,7 +75,7 @@ pub struct View<'a> {
 }
 impl<'a> View<'a> {
     pub fn pin(chain: &'a Chain, profile: Profile, now: i64) -> Result<Self> {
-        if hash_bytes(chain.genesis().hash()) != profile.manifest.genesis {
+        if hash_bytes(chain.genesis().hash()) != profile.genesis {
             return Err(Error::View);
         }
         let head = chain.head_header().map_err(unavailable)?;
@@ -249,7 +247,7 @@ where
         }
         Parent::Receipt(id) => Some(*id),
     };
-    let depth = usize::from(view.profile.manifest.uncle_depth);
+    let depth = usize::from(view.profile.uncle_depth);
     let history_limit = view.profile.work_window_limit();
     let mut spine = Vec::new();
     let mut primary = std::collections::BTreeSet::new();
@@ -275,7 +273,7 @@ where
     let mut loaded = Vec::new();
     for (index, work) in spine.iter().take(history_limit).enumerate() {
         let job = work.job();
-        if job.uncles.0.len() > usize::from(view.profile.manifest.max_uncles) {
+        if job.uncles.0.len() > usize::from(view.profile.max_uncles) {
             return Err(Error::Invalid("too many uncles"));
         }
         let ancestors = &spine[index + 1..(index + 1 + depth).min(spine.len())];
@@ -350,11 +348,8 @@ impl Work {
     pub fn header(&self) -> &BlockHeader {
         &self.header
     }
-    pub fn authorize(&self, auth: &WorkAuthorization, protocol: Id) -> Result<()> {
-        if self.job.protocol != protocol
-            || auth.fields.protocol != protocol
-            || auth.fields.work_id != self.id
-        {
+    pub fn authorize(&self, auth: &WorkAuthorization, pool_id: Id) -> Result<()> {
+        if self.job.pool_id != pool_id || auth.fields.work_id != self.id {
             return Err(Error::Witness("work authorization relation"));
         }
         let public = public_key(self.job.account)?;
@@ -367,8 +362,8 @@ impl Work {
         let core: Core = decode(bytes)?;
         let job: Job = decode(&core.job.0)?;
         let header: BlockHeader = parse(&core.header.0)?;
-        if job.protocol != view.profile.protocol {
-            return Err(Error::Invalid("protocol"));
+        if job.pool_id != view.profile.pool_id {
+            return Err(Error::Invalid("pool identity mismatch"));
         }
         if job.timestamp < 0 {
             return Err(Error::Invalid("timestamp"));
@@ -381,7 +376,7 @@ impl Work {
         let parent = view.anchor(&job.anchor)?;
         let target = view.target(&job.anchor)?;
         let d = job.difficulty;
-        if d < consensus::graph_weight(header.height, view.profile.manifest.edge_bits) {
+        if d < consensus::graph_weight(header.height, view.profile.edge_bits) {
             return Err(Error::Invalid("assigned graph weight"));
         }
         if header.prev_hash != parent.hash()
@@ -413,13 +408,13 @@ impl Work {
         if job.timestamp
             > view
                 .now
-                .checked_add(i64::from(view.profile.manifest.future_seconds))
+                .checked_add(i64::from(view.profile.future_seconds))
                 .ok_or(Error::Invalid("clock overflow"))?
         {
             return Err(Error::Future);
         }
-        if header.pow.edge_bits() != view.profile.manifest.edge_bits
-            || header.pow.proof.proof_size() != view.profile.manifest.proof_size as usize
+        if header.pow.edge_bits() != view.profile.edge_bits
+            || header.pow.proof.proof_size() != view.profile.proof_size as usize
         {
             return Err(Error::Invalid("proof profile"));
         }
@@ -431,7 +426,7 @@ impl Work {
                 return Err(Error::Invalid("root parent"));
             }
         }
-        if header.total_kernel_offset.as_ref() != scalar(job.protocol, id(&job)?)? {
+        if header.total_kernel_offset.as_ref() != scalar(id(&job)?)? {
             return Err(Error::Invalid("job offset binding"));
         }
         let outputs = leaves(header.output_mmr_size)?

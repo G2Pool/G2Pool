@@ -125,8 +125,8 @@ impl Signer {
     pub fn account(&self) -> Point {
         self.account
     }
-    pub fn authorize(&self, protocol: Id, work_id: Id) -> Result<WorkAuthorization> {
-        let fields = WorkAuthMessage { protocol, work_id };
+    pub fn authorize(&self, work_id: Id) -> Result<WorkAuthorization> {
+        let fields = WorkAuthMessage { work_id };
         let signature = sign(&self.account_secret, id(&fields)?)?;
         Ok(WorkAuthorization { fields, signature })
     }
@@ -161,7 +161,7 @@ impl Signer {
     fn coupon<C: grin_wallet_libwallet::NodeClient + 'static>(
         &self,
         payments: &payments::Payments<C>,
-        protocol: Id,
+        pool_id: Id,
         value: u64,
     ) -> Result<Object> {
         let reward = payments.reward(self, value)?;
@@ -174,7 +174,7 @@ impl Signer {
             kernel: Blob(native::native_bytes(&reward.kernel)?),
         };
         let fields = CouponAuth {
-            protocol,
+            pool_id,
             owner: self.account,
             reward_id: id(&reward)?,
         };
@@ -201,7 +201,7 @@ impl Signer {
             .transpose()?;
         let mut objects = Vec::new();
         let mut coupon = |value| -> Result<Id> {
-            let object = self.coupon(payments, view.profile.protocol, value)?;
+            let object = self.coupon(payments, view.profile.pool_id, value)?;
             let id = object.key.id;
             objects.push(object);
             Ok(id)
@@ -209,7 +209,7 @@ impl Signer {
         let mut revision = 0;
         let mut inventory = None;
         if let Some(previous) = &previous {
-            if previous.fields.protocol == view.profile.protocol
+            if previous.fields.pool_id == view.profile.pool_id
                 && previous.fields.owner == self.account
                 && view.anchor(&previous.fields.birth).is_ok()
                 && view.head.height
@@ -217,7 +217,7 @@ impl Signer {
                         .fields
                         .birth
                         .height
-                        .saturating_add(view.profile.manifest.lifetime)
+                        .saturating_add(view.profile.lifetime)
             {
                 let bytes = store.read(Key::new(Kind::Inventory, previous.fields.inventory))?;
                 inventory = Some(decode::<Inventory>(&bytes)?);
@@ -228,11 +228,10 @@ impl Signer {
         }
         let mut changed = false;
         let mut inv = inventory.unwrap_or_else(|| Inventory {
-            protocol: view.profile.protocol,
             owner: self.account,
             rows: List(vec![]),
         });
-        let base = view.profile.manifest.unit_budget.ilog2() + 1;
+        let base = view.profile.unit_budget.ilog2() + 1;
         if inv.rows.0.is_empty() {
             for (family, count) in [(0, base), (1, 3)] {
                 for row in 0..count {
@@ -296,7 +295,7 @@ impl Signer {
         view.check()?;
         let iid = id(&inv)?;
         let fields = RegistrationAuth {
-            protocol: view.profile.protocol,
+            pool_id: view.profile.pool_id,
             owner: self.account,
             inventory: iid,
             birth: view.head.clone(),

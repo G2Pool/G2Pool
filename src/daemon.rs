@@ -27,6 +27,7 @@ use std::{
 pub struct Config {
     pub data: PathBuf,
     pub network: ChainTypes,
+    pub pool_file: Option<PathBuf>,
     pub stratum: SocketAddr,
     pub peer: SocketAddr,
     pub grin_host: IpAddr,
@@ -73,6 +74,7 @@ impl Config {
     pub(crate) fn load(
         base: PathBuf,
         network: ChainTypes,
+        pool_file: Option<PathBuf>,
         stratum: Option<SocketAddr>,
         peer: Option<SocketAddr>,
         grin: Option<SocketAddr>,
@@ -91,6 +93,7 @@ impl Config {
         let config = Self {
             data,
             network,
+            pool_file,
             stratum: stratum
                 .or_else(|| saved.as_ref().map(|s| s.stratum))
                 .unwrap_or_else(|| ([127, 0, 0, 1], if testnet { 13420 } else { 3420 }).into()),
@@ -123,23 +126,6 @@ impl Config {
         Ok(config)
     }
 }
-const BOOTSTRAP_PEERS: [std::net::Ipv4Addr; 2] = [
-    std::net::Ipv4Addr::new(188, 119, 24, 7),
-    std::net::Ipv4Addr::new(51, 83, 197, 245),
-];
-fn default_pool_port(network: ChainTypes) -> u16 {
-    if network == ChainTypes::Testnet {
-        13417
-    } else {
-        3417
-    }
-}
-pub fn bootstrap_peers(config: &Config) -> Vec<SocketAddr> {
-    BOOTSTRAP_PEERS
-        .iter()
-        .map(|ip| SocketAddr::new((*ip).into(), default_pool_port(config.network)))
-        .collect()
-}
 pub fn open_node_lock(data: &std::path::Path) -> Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -163,36 +149,6 @@ fn validate_node_lock(data: &std::path::Path, process_lock: &fs::File) -> Result
         use std::os::unix::fs::MetadataExt;
         if opened.dev() != named.dev() || opened.ino() != named.ino() {
             return Err(Error::Invalid("node lock changed during startup"));
-        }
-    }
-    Ok(())
-}
-pub fn require_new_wallet_directory(data: &std::path::Path) -> Result<()> {
-    match fs::symlink_metadata(data) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(Error::Invalid("data directory must be a real directory"))
-        }
-        Ok(_) => {}
-    }
-    for entry in fs::read_dir(data)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        let allowed = match entry.file_name().to_str() {
-            Some("grin") => metadata.is_dir() && !metadata.file_type().is_symlink(),
-            Some(
-                "node.lock"
-                | "instance.json"
-                | "node-status.json"
-                | "g2pool.control.lock"
-                | ".g2pool-node-api-secret"
-                | ".g2pool-node-foreign-api-secret",
-            ) => metadata.is_file() && !metadata.file_type().is_symlink(),
-            _ => false,
-        };
-        if !allowed {
-            return Err(Error::Invalid("Grin wallet seed missing from established pool data; refusing to generate a replacement"));
         }
     }
     Ok(())
@@ -262,10 +218,14 @@ pub fn run(config: Config) -> Result<()> {
         .map_err(|_| Error::Capacity("another node owns this data directory"))?;
     validate_node_lock(&config.data, &process_lock)?;
     let wallet_existed = crate::wallet::exists(&config.data)?;
-    if !wallet_existed {
-        require_new_wallet_directory(&config.data)?;
-    }
-    let bootstrap_peers = bootstrap_peers(&config);
+    let pool = crate::pool::Pool::load(
+        config
+            .data
+            .parent()
+            .ok_or(Error::Invalid("data directory"))?,
+        config.pool_file.as_deref(),
+    )?;
+    let bootstrap_peers = pool.peers(config.network)?;
 
     global::init_global_chain_type(config.network);
     global::set_local_chain_type(config.network);
@@ -316,13 +276,17 @@ pub fn run(config: Config) -> Result<()> {
         workers: Vec::new(),
     };
     let genesis = native::hash_bytes(chain.genesis().hash());
-    let manifest = native::manifest(genesis, config.network);
-    let profile = Profile::new(manifest)?;
+    let profile = Profile::new(genesis, config.network, &pool);
     let mut store = Store::open(
         &config.data.join("pool"),
-        profile.protocol,
+        profile.pool_id,
         config.storage.clone(),
     )?;
+    if !wallet_existed && store.wallet_record("account")?.is_some() {
+        return Err(Error::Invalid(
+            "Grin wallet seed missing from established pool data; refusing to generate a replacement",
+        ));
+    }
     let payment_service = Arc::new(initialize_wallet(
         &config.data,
         &process_lock,
@@ -346,15 +310,16 @@ pub fn run(config: Config) -> Result<()> {
     node.cancel = stop.clone();
     node.peers = crate::network::peers::Book::open_store(
         &node.store,
-        node.profile.protocol,
+        node.profile.pool_id,
         false,
         &bootstrap_peers,
     )?;
     node.listening_port = config.peer.port();
     node.ensure_view()?;
     println!(
-        "protocol={} account={}",
-        hex(&node.profile.protocol),
+        "pool={} pool-id={} account={}",
+        pool.name,
+        hex(&node.profile.pool_id),
         hex(&wallet.account())
     );
     println!(
@@ -378,7 +343,7 @@ pub fn run(config: Config) -> Result<()> {
         node.lock()
             .map_err(|_| Error::Invalid("node poisoned"))?
             .profile
-            .protocol,
+            .pool_id,
         stop.clone(),
     )
     .map_err(|error| Error::NativeUnavailable(format!("wallet service: {error}")))?;
@@ -404,12 +369,14 @@ pub fn run(config: Config) -> Result<()> {
         node.clone(),
         stop.clone(),
         crate::network::INBOUND_PEERS,
+        pool.key(),
     )?;
     runtime.workers.push(peer_thread);
     let monitor = {
         let guard = node.lock().map_err(|_| Error::Invalid("node poisoned"))?;
         crate::status::runtime::Monitor::new(
             &guard,
+            pool.name.clone(),
             config.data.clone(),
             runtime.server.as_ref().map(|s| s.sync_state.clone()),
         )

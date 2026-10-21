@@ -28,3 +28,23 @@ fn global_options_work_on_either_side_of_subcommands() {
         .try_get_matches_from(["g2pool", "--scan-wallet-internal"])
         .is_err());
 }
+
+#[test]
+fn explicit_pool_path_is_a_startup_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let matches = command()
+        .try_get_matches_from([
+            "g2pool",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--pool",
+            "private.json",
+        ])
+        .unwrap();
+    let config = config(&matches).unwrap();
+    assert_eq!(
+        config.pool_file.as_deref(),
+        Some(std::path::Path::new("private.json"))
+    );
+    assert!(!dir.path().join("pool.json").exists());
+}

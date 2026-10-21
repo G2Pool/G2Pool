@@ -110,16 +110,16 @@ impl Node {
         mut store: Store,
         limits: Limits,
     ) -> Result<Self> {
-        if u64::from(grin_core::global::cut_through_horizon()) < 2 * profile.manifest.lifetime - 2 {
+        if u64::from(grin_core::global::cut_through_horizon()) < 2 * profile.lifetime - 2 {
             return Err(Error::NativeUnavailable(
                 "native rewind horizon is shorter than pool finance horizon".into(),
             ));
         }
-        if profile.protocol != store.protocol() {
-            return Err(Error::Invalid("node protocol"));
+        if profile.pool_id != store.pool_id() {
+            return Err(Error::Invalid("node pool identity"));
         }
         store.attach_native(chain.clone(), profile.clone())?;
-        let peers = crate::network::peers::Book::memory(profile.manifest.network >= 2);
+        let peers = crate::network::peers::Book::memory(profile.network >= 2);
         let mut node = Self {
             connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             published: Arc::new(std::sync::RwLock::new(Published::default())),
@@ -354,7 +354,7 @@ impl Node {
             .filter(|c| c.class == 0)
             .count() as u64;
         if (candidate.boundary.is_none() && incumbent.boundary.is_none())
-            || primary_count * u64::from(self.profile.manifest.share_target_seconds)
+            || primary_count * u64::from(self.profile.share_target_seconds)
                 < grin_core::consensus::BLOCK_TIME_SEC
         {
             view.check()?;

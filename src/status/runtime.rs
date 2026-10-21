@@ -18,6 +18,8 @@ pub(crate) const RESERVE: u64 = 1024 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    pub pool_name: String,
+    pub pool_id: String,
     pub updated_at: i64,
     pub state: String,
     pub native_height: u64,
@@ -53,6 +55,8 @@ fn state(
     }
 }
 pub struct Monitor {
+    pool_name: String,
+    pool_id: String,
     chain: std::sync::Arc<grin_chain::Chain>,
     published: Arc<RwLock<Published>>,
     peers: Arc<AtomicUsize>,
@@ -61,8 +65,15 @@ pub struct Monitor {
     database: crate::storage::sharechain::SharechainDb,
 }
 impl Monitor {
-    pub fn new(node: &Node, path: PathBuf, sync: Option<Arc<grin_chain::SyncState>>) -> Self {
+    pub fn new(
+        node: &Node,
+        pool_name: String,
+        path: PathBuf,
+        sync: Option<Arc<grin_chain::SyncState>>,
+    ) -> Self {
         Self {
+            pool_name,
+            pool_id: crate::objects::hex(&node.profile.pool_id),
             chain: node.chain.clone(),
             published: node.published.clone(),
             peers: node.connected.clone(),
@@ -88,6 +99,8 @@ impl Monitor {
                 let free = fs2::available_space(&self.path).ok();
                 let pressure = free.is_none_or(|bytes| bytes < RESERVE);
                 let status = Snapshot {
+                    pool_name: self.pool_name.clone(),
+                    pool_id: self.pool_id.clone(),
                     updated_at: chrono::Utc::now().timestamp(),
                     state: state(
                         syncing,
@@ -130,7 +143,7 @@ impl Monitor {
 }
 pub fn read(data: &Path) -> Result<Snapshot> {
     let path = data.join(FILE);
-    let bytes = crate::secure_file::read_regular(&path, 4096, false)
+    let bytes = crate::secure_file::read_regular(&path, super::wallet::MAX_SNAPSHOT_BYTES, false)
         .map_err(|error| Error::NativeUnavailable(format!("node status: {error}")))?;
     let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
     let age = chrono::Utc::now()

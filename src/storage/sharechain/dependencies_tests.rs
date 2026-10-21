@@ -7,8 +7,8 @@ struct Fixture {
     max_record_bytes: usize,
 }
 impl Fixture {
-    fn open(path: &Path, map_bytes: usize, max_record_bytes: usize, protocol: Id) -> Result<Self> {
-        let env = Environment::open(path, map_bytes, protocol)?.env;
+    fn open(path: &Path, map_bytes: usize, max_record_bytes: usize, pool_id: Id) -> Result<Self> {
+        let env = Environment::open(path, map_bytes, pool_id)?.env;
         let mut tx = env.write_txn()?;
         let dependencies = DependencyDb::open_runtime(&env, &mut tx)?;
         tx.commit()?;

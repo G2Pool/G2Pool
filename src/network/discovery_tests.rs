@@ -4,8 +4,8 @@ use super::*;
 fn retained_connection_refreshes_its_peer_list_without_reconnecting() {
     let (left, _left_keys, _left_wallet, _left_dir) = crate::node::tests::setup();
     let (right, _right_keys, _right_wallet, _right_dir) = crate::node::tests::setup();
-    assert_eq!(left.profile.protocol, right.profile.protocol);
-    let protocol = left.profile.protocol;
+    assert_eq!(left.profile.pool_id, right.profile.pool_id);
+    let pool_id = left.profile.pool_id;
     let left = Arc::new(Mutex::new(left));
     let right = Arc::new(Mutex::new(right));
     let stop = Arc::new(AtomicBool::new(false));
@@ -27,12 +27,26 @@ fn retained_connection_refreshes_its_peer_list_without_reconnecting() {
     let right_address = port();
     left.lock().unwrap().listening_port = left_address.port();
     right.lock().unwrap().listening_port = right_address.port();
-    servers
-        .1
-        .push(start(left_address, left.clone(), stop.clone(), 4).unwrap());
-    servers
-        .1
-        .push(start(right_address, right.clone(), stop.clone(), 4).unwrap());
+    servers.1.push(
+        start(
+            left_address,
+            left.clone(),
+            stop.clone(),
+            4,
+            crate::pool::Pool::alpha().key(),
+        )
+        .unwrap(),
+    );
+    servers.1.push(
+        start(
+            right_address,
+            right.clone(),
+            stop.clone(),
+            4,
+            crate::pool::Pool::alpha().key(),
+        )
+        .unwrap(),
+    );
     let first = "8.8.8.8:3417".parse().unwrap();
     let later = "9.9.9.9:3417".parse().unwrap();
     let now = chrono::Utc::now().timestamp();
@@ -41,7 +55,7 @@ fn retained_connection_refreshes_its_peer_list_without_reconnecting() {
         right.peers.seed(first).unwrap();
         right.peers.outcome(first, true, now).unwrap();
     }
-    let mut client = Client::new(right_address, protocol);
+    let mut client = Client::new(right_address, pool_id);
     client.synchronize_turns(&left, &stop, 0).unwrap();
     assert!(left
         .lock()

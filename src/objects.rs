@@ -4,8 +4,7 @@ use std::{fmt, sync::Arc};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Kind {
-    Manifest = 0,
-    Reward,
+    Reward = 1,
     Coupon,
     Inventory,
     Registration,
@@ -22,7 +21,6 @@ pub enum Kind {
 impl Kind {
     pub fn from_byte(byte: u8) -> Result<Self> {
         match byte {
-            0 => Ok(Self::Manifest),
             1 => Ok(Self::Reward),
             2 => Ok(Self::Coupon),
             3 => Ok(Self::Inventory),
@@ -41,7 +39,6 @@ impl Kind {
     }
     pub fn domain(self) -> &'static str {
         match self {
-            Self::Manifest => "PROTOCOL",
             Self::Reward => "REWARD",
             Self::Coupon => "COUPON",
             Self::Inventory => "INVENTORY",
@@ -59,7 +56,6 @@ impl Kind {
     }
     pub fn ceiling(self) -> usize {
         match self {
-            Self::Manifest => <Manifest as Object>::MAX,
             Self::Reward => <Reward as Object>::MAX,
             Self::Coupon => <Coupon as Object>::MAX,
             Self::Inventory => <Inventory as Object>::MAX,
@@ -87,7 +83,7 @@ macro_rules! stored {
         impl StoredObject for $record { const KIND: Kind=Kind::$kind; }
     )*};
 }
-stored!(Manifest=>Manifest,Reward=>Reward,Coupon=>Coupon,Inventory=>Inventory,
+stored!(Reward=>Reward,Coupon=>Coupon,Inventory=>Inventory,
     Registration=>Registration,PayoutRecord=>Payout,EncodingPlan=>Encoding,
     TxOnly=>Transaction,Kernel=>Kernel,FinderOutput=>Finder,Job=>Job);
 

@@ -10,7 +10,7 @@ fn traversal_and_ledger_payout_windows_stop_when_an_uncle_fills_the_budget() {
         let work = Work {
             id,
             job: Job {
-                protocol: view.profile.protocol,
+                pool_id: view.profile.pool_id,
                 anchor: view.head.clone(),
                 timestamp: 0,
                 parent: if n == 3 {
@@ -175,7 +175,7 @@ fn mixed_retention_byte_deltas_match_full_recount() {
             hash: id,
         };
         let job = Job {
-            protocol: [0; 32],
+            pool_id: [0; 32],
             anchor: anchor.clone(),
             timestamp: 0,
             parent: Parent::Root(anchor.clone()),
@@ -211,7 +211,7 @@ fn mixed_retention_byte_deltas_match_full_recount() {
             RegistrationFacts {
                 registration: Arc::new(Registration {
                     fields: RegistrationAuth {
-                        protocol: [0; 32],
+                        pool_id: [0; 32],
                         owner: [0; 33],
                         inventory: id,
                         birth: anchor,
@@ -220,7 +220,6 @@ fn mixed_retention_byte_deltas_match_full_recount() {
                     signature: [0; 64],
                 }),
                 inventory: Arc::new(Inventory {
-                    protocol: [0; 32],
                     owner: [0; 33],
                     rows: List(vec![InventoryRow {
                         family: 0,

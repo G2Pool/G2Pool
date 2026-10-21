@@ -195,7 +195,6 @@ impl Preparation {
             let encoding = if let Some(kernel) = aggregate {
                 let native = Blob(native::native_bytes(&kernel)?);
                 let object = Kernel {
-                    protocol: profile.protocol,
                     native: native.clone(),
                 };
                 aggregate_kernels.push(native);
@@ -211,16 +210,13 @@ impl Preparation {
             });
         }
         let encoding = EncodingPlan {
-            protocol: profile.protocol,
             entries: List(entries),
         };
         let tx = TxOnly {
-            protocol: profile.protocol,
             native: Blob(native::native_bytes(&transaction)?),
         };
         let reward = payments.reward(wallet, financial.record.finder)?;
         let finder = FinderOutput {
-            protocol: profile.protocol,
             output: Blob(native::native_bytes(&reward.output)?),
         };
         let native_parent = view.anchor(&view.head)?;
@@ -233,7 +229,7 @@ impl Preparation {
                 .ok_or(Error::Invalid("timestamp overflow"))?,
         );
         let job = Job {
-            protocol: profile.protocol,
+            pool_id: profile.pool_id,
             anchor: view.head.clone(),
             timestamp,
             parent,
@@ -247,7 +243,7 @@ impl Preparation {
             finder_commitment: reward.output.commitment().0,
             finder_output: id(&finder)?,
         };
-        let scalar = scalar(profile.protocol, id(&job)?)?;
+        let scalar = scalar(id(&job)?)?;
         let negative = {
             let handle = static_secp_instance();
             let secp = handle.lock();
@@ -295,8 +291,8 @@ impl Preparation {
             chrono::DateTime::from_timestamp(timestamp, 0).ok_or(Error::Invalid("timestamp"))?;
         block.header.pow.secondary_scaling = target.secondary_scaling;
         block.header.pow.proof = Proof {
-            edge_bits: profile.manifest.edge_bits,
-            nonces: vec![0; profile.manifest.proof_size as usize],
+            edge_bits: profile.edge_bits,
+            nonces: vec![0; profile.proof_size as usize],
         };
         block.header.total_kernel_offset = BlindingFactor::from_slice(&scalar);
         block.body = block.body.with_kernel(binding);
@@ -311,7 +307,6 @@ impl Preparation {
             .map_err(|e| Error::NativeUnavailable(e.to_string()))?;
         view.candidate(&block)?;
         let residual = Residual {
-            protocol: profile.protocol,
             finder_kernel: Blob(native::native_bytes(&reward.kernel)?),
             binding_kernel: Blob(native::native_bytes(&binding)?),
             aggregate_kernels: List(aggregate_kernels),
@@ -413,7 +408,7 @@ fn uncles(
     let mut cursor = Some(*tip);
     let mut ancestors = Vec::new();
     let mut forbidden = BTreeSet::new();
-    let depth = usize::from(view.profile.manifest.uncle_depth);
+    let depth = usize::from(view.profile.uncle_depth);
     for _ in 0..depth {
         let Some(id) = cursor else { break };
         let bytes = match store.read(Key::new(Kind::Core, id)) {
@@ -451,7 +446,7 @@ fn uncles(
             ) => continue,
             Err(error) => return Err(error),
         };
-        if work.job().uncles.0.len() > usize::from(view.profile.manifest.max_uncles) {
+        if work.job().uncles.0.len() > usize::from(view.profile.max_uncles) {
             continue;
         }
         if ancestors
@@ -467,6 +462,6 @@ fn uncles(
         }
     }
     uncles.sort();
-    uncles.truncate(usize::from(view.profile.manifest.max_uncles));
+    uncles.truncate(usize::from(view.profile.max_uncles));
     Ok(uncles)
 }

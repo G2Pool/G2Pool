@@ -11,20 +11,28 @@ async fn listen(swarm: &mut Swarm<Behaviour>) -> Multiaddr {
     }
 }
 #[tokio::test]
-async fn profile_bound_noise_rejects_other_network_before_requests() {
-    tokio::time::timeout(Duration::from_secs(10),async {
-        let mut a=swarm([1;32],Budgets::default(),2,super::super::bans::IpBans::default()).unwrap();let mut b=swarm([2;32],Budgets::default(),2,super::super::bans::IpBans::default()).unwrap();
-        let address=listen(&mut b).await;a.dial(address).unwrap();
-        loop{tokio::select!{
-            e=a.select_next_some()=>match e {SwarmEvent::ConnectionEstablished{..}=>panic!("wrong profile connected"),SwarmEvent::OutgoingConnectionError{..}=>break,_=>{}},
-            e=b.select_next_some()=>{assert!(!matches!(e,SwarmEvent::ConnectionEstablished{..}));}
-        }}
-    }).await.unwrap();
+async fn pool_keys_and_native_network_identity_are_checked_before_requests() {
+    for (pool_id, key) in [([2; 32], [7; 32]), ([1; 32], [8; 32])] {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut a = swarm([1; 32], [7; 32], Budgets::default(), 2, super::super::bans::IpBans::default()).unwrap();
+            let mut b = swarm(pool_id, key, Budgets::default(), 2, super::super::bans::IpBans::default()).unwrap();
+            let address = listen(&mut b).await;
+            a.dial(address).unwrap();
+            loop { tokio::select! {
+                event = a.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { .. } => panic!("different pool connected"),
+                    SwarmEvent::OutgoingConnectionError { .. } => break,
+                    _ => {},
+                },
+                event = b.select_next_some() => assert!(!matches!(event, SwarmEvent::ConnectionEstablished { .. })),
+            } }
+        }).await.unwrap();
+    }
 }
 #[tokio::test]
-async fn real_schema_is_bidirectional_and_payload_ticket_survives_delivery() {
+async fn pool_transport_is_bidirectional_and_payload_ticket_survives_delivery() {
     tokio::time::timeout(Duration::from_secs(45),async {
-        let budgets=Budgets::default();let mut a=swarm([1;32],budgets.clone(),2,super::super::bans::IpBans::default()).unwrap();let mut b=swarm([1;32],Budgets::default(),2,super::super::bans::IpBans::default()).unwrap();
+        let budgets=Budgets::default();let mut a=swarm([1;32],[7;32],budgets.clone(),2,super::super::bans::IpBans::default()).unwrap();let mut b=swarm([1;32],[7;32],Budgets::default(),2,super::super::bans::IpBans::default()).unwrap();
         let aa=listen(&mut a).await;let ba=listen(&mut b).await;
         a.dial(libp2p::swarm::dial_opts::DialOpts::unknown_peer_id().address(ba).allocate_new_port().build()).unwrap();
         b.dial(libp2p::swarm::dial_opts::DialOpts::unknown_peer_id().address(aa).allocate_new_port().build()).unwrap();let aid=*a.local_peer_id();let bid=*b.local_peer_id();
@@ -32,9 +40,9 @@ async fn real_schema_is_bidirectional_and_payload_ticket_survives_delivery() {
         loop{tokio::select!{_= &mut settle=>break,_=a.select_next_some()=>{},_=b.select_next_some()=>{}}}
         assert!(a.is_connected(&bid));assert!(b.is_connected(&aid));
         assert_eq!(a.network_info().connection_counters().num_established(),1);assert_eq!(b.network_info().connection_counters().num_established(),1);
-        let object=crate::storage::Object::content(&crate::codec::TxOnly{protocol:[1;32],native:crate::codec::Blob(vec![41; 8*1024*1024-128])}).unwrap();
+        let object=crate::storage::Object::content(&crate::codec::TxOnly{native:crate::codec::Blob(vec![41; 8*1024*1024-128])}).unwrap();
         let key=object.key;let missing=crate::objects::Key::new(crate::objects::Kind::Coupon,[2;32]);
-        let get=Message::Get(vec![key,missing]);let reservation=get.response_ceiling().unwrap()*6;
+        let get=Message::Get(vec![key,missing]);let reservation=(get.response_ceiling().unwrap()+ENVELOPE)*6;
         let ticket=budgets.receive.reserve(reservation).unwrap();
         a.behaviour_mut().bulk.send_request(&bid,Request{message:get,ticket});
         b.behaviour_mut().control.send_request(&aid,Request{message:Message::Heads,ticket:budgets.control.reserve(CONTROL*6).unwrap()});
@@ -80,7 +88,13 @@ async fn codec_rejects_wrong_role_and_oversize_before_body_allocation() {
                 ticket: budgets.control.reserve(4096).unwrap(),
             }),
         };
-        let mut wire = (length as u32).to_be_bytes().to_vec();
+        let mut wire = ((length + 2 + crate::VERSION.len() + crate::MIN_PEER_VERSION.len()) as u32)
+            .to_be_bytes()
+            .to_vec();
+        wire.push(crate::VERSION.len() as u8);
+        wire.extend(crate::VERSION.as_bytes());
+        wire.push(crate::MIN_PEER_VERSION.len() as u8);
+        wire.extend(crate::MIN_PEER_VERSION.as_bytes());
         wire.push(tag);
         assert!(codec
             .read_response(

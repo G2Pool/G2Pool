@@ -144,7 +144,7 @@ fn pending_solution_retains_dependencies_through_collection_and_restart() {
     drop(solutions);
     let store = Store::open(
         &path,
-        profile.protocol,
+        profile.pool_id,
         crate::storage::StorageLimits::default(),
     )
     .unwrap();

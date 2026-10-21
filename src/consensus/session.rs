@@ -9,7 +9,7 @@ pub enum EvaluationProgress {
 pub struct Session {
     tip: Id,
     anchor: Anchor,
-    protocol: Id,
+    pool_id: Id,
     cursor: Option<Id>,
     previous: u64,
     ranked: bool,
@@ -28,13 +28,13 @@ pub struct Session {
     history: BTreeMap<Id, (usize, usize)>,
 }
 impl Session {
-    pub fn new(tip: Id, anchor: Anchor, protocol: Id) -> Self {
+    pub fn new(tip: Id, anchor: Anchor, pool_id: Id) -> Self {
         Self {
             tip,
             previous: anchor.height,
             ledger: Ledger::new(anchor.height),
             anchor,
-            protocol,
+            pool_id,
             cursor: Some(tip),
             ranked: false,
             reuse: None,
@@ -158,7 +158,7 @@ impl Session {
         cancel: Arc<AtomicBool>,
         quantum: usize,
     ) -> Result<EvaluationProgress> {
-        if view.profile.protocol != self.protocol {
+        if view.profile.pool_id != self.pool_id {
             return Err(Error::View);
         }
         self.rebase(view)?;

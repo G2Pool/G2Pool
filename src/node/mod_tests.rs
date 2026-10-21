@@ -32,11 +32,11 @@ pub(crate) fn setup() -> (
         )
         .unwrap(),
     );
-    let profile = Profile::new(crate::native::manifest(
+    let profile = Profile::new(
         crate::native::hash_bytes(chain.genesis().hash()),
         ChainTypes::AutomatedTesting,
-    ))
-    .unwrap();
+        &crate::pool::Pool::alpha(),
+    );
     let payments = crate::wallet::payments::Payments::create(
         dir.path(),
         crate::wallet::payments::tests::Offline,
@@ -45,7 +45,7 @@ pub(crate) fn setup() -> (
     let wallet = payments.signer().unwrap();
     let mut store = Store::open(
         &dir.path().join("pool"),
-        profile.protocol,
+        profile.pool_id,
         StorageLimits {
             heads: 1,
             ..Default::default()
@@ -113,7 +113,7 @@ fn share_at(
     if let Some(timestamp) = timestamp {
         template.job.timestamp = timestamp;
         template.block.header.timestamp = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
-        let scalar = scalar(node.profile.protocol, id(&template.job).unwrap()).unwrap();
+        let scalar = scalar(id(&template.job).unwrap()).unwrap();
         let parent = node.view().unwrap().anchor(&template.job.anchor).unwrap();
         let negative = {
             let handle = grin_util::static_secp_instance();
@@ -173,7 +173,7 @@ fn share_at(
         Object::new(Key::new(Kind::Core, id), encode(&core).unwrap()).unwrap(),
         Object::new(
             Key::new(Kind::Authorization, id),
-            encode(&wallet.authorize(node.profile.protocol, id).unwrap()).unwrap(),
+            encode(&wallet.authorize(id).unwrap()).unwrap(),
         )
         .unwrap(),
         Object::new(
@@ -259,7 +259,7 @@ fn reorg_retires_invalid_root_after_restart_and_allows_new_work() {
     let profile = node.profile.clone();
     let path = node.store.path().to_owned();
     drop(node);
-    let store = Store::open(&path, profile.protocol, StorageLimits::default()).unwrap();
+    let store = Store::open(&path, profile.pool_id, StorageLimits::default()).unwrap();
     let mut node = Node::start(chain, profile, store, Limits::default()).unwrap();
     recover(&mut node);
     assert!(node.store.heads().unwrap().is_empty());
@@ -368,13 +368,13 @@ fn valid_witness_retransmission_recovers_an_unsealed_candidate() {
 fn pruned_branch_bootstraps_across_native_extension_and_restart() {
     let (source, signer, payments, source_dir) = setup();
     let mut profile = source.profile.clone();
-    profile.manifest.lifetime = 8;
-    profile.protocol = id(&profile.manifest).unwrap();
+    profile.lifetime = 8;
+
     let chain = source.chain.clone();
     drop(source);
     let mut store = Store::open(
         &source_dir.path().join("rolling"),
-        profile.protocol,
+        profile.pool_id,
         StorageLimits {
             heads: 1,
             ..StorageLimits::default()
@@ -385,8 +385,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
     let mut source = Node::start(chain, profile, store, Limits::default()).unwrap();
     let mut origin = None;
     let mut tip = [0; 32];
-    let shares =
-        4 * (source.profile.work_window_limit() + usize::from(source.profile.manifest.uncle_depth));
+    let shares = 4 * (source.profile.work_window_limit() + usize::from(source.profile.uncle_depth));
     let start = chrono::Utc::now().timestamp() - shares as i64 * 10;
     for i in 0..shares {
         tip = share_at(&mut source, &signer, &payments, Some(start + i as i64 * 10)).0;
@@ -405,7 +404,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
     ));
     let cold = tempfile::tempdir().unwrap();
     let path = cold.path().join("pool");
-    let store = Store::open(&path, source.profile.protocol, StorageLimits::default()).unwrap();
+    let store = Store::open(&path, source.profile.pool_id, StorageLimits::default()).unwrap();
     let mut target = Node::start(
         source.chain.clone(),
         source.profile.clone(),
@@ -484,7 +483,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
             .unwrap()
     );
     drop(target);
-    let store = Store::open(&path, source.profile.protocol, StorageLimits::default()).unwrap();
+    let store = Store::open(&path, source.profile.pool_id, StorageLimits::default()).unwrap();
     let mut target = Node::start(
         source.chain.clone(),
         source.profile.clone(),
@@ -603,7 +602,7 @@ fn short_branches_preserve_incumbent_across_refresh_and_restart_and_enforce_fres
     let peer = |name: &str| {
         let store = Store::open(
             &dir.path().join(name),
-            left.profile.protocol,
+            left.profile.pool_id,
             StorageLimits::default(),
         )
         .unwrap();
@@ -651,7 +650,7 @@ fn short_branches_preserve_incumbent_across_refresh_and_restart_and_enforce_fres
     assert_eq!(target.parent().unwrap(), Parent::Receipt(incumbent));
     let path = target.store.path().to_owned();
     drop(target);
-    let store = Store::open(&path, left.profile.protocol, StorageLimits::default()).unwrap();
+    let store = Store::open(&path, left.profile.pool_id, StorageLimits::default()).unwrap();
     let mut target = Node::start(
         left.chain.clone(),
         left.profile.clone(),
@@ -688,8 +687,8 @@ fn short_branches_preserve_incumbent_across_refresh_and_restart_and_enforce_fres
 fn disconnected_branches_compare_recent_work_with_native_freshness() {
     let (node, signer, payments, dir) = setup();
     let mut profile = node.profile.clone();
-    profile.manifest.share_window = 12;
-    profile.protocol = id(&profile.manifest).unwrap();
+    profile.share_window = 12;
+
     let mut block = native_block(&node, &node.chain.head_header().unwrap(), 400);
     let now = chrono::Utc::now().timestamp();
     block.header.timestamp = chrono::DateTime::from_timestamp(now - 600, 0).unwrap();
@@ -713,11 +712,11 @@ fn disconnected_branches_compare_recent_work_with_native_freshness() {
         .unwrap();
     let branch = |name: &str, start: i64, interval: i64, window: u32| {
         let mut profile = profile.clone();
-        profile.manifest.share_window = window;
-        profile.protocol = id(&profile.manifest).unwrap();
+        profile.share_window = window;
+
         let store = Store::open(
             &dir.path().join(name),
-            profile.protocol,
+            profile.pool_id,
             StorageLimits {
                 heads: 1,
                 ..StorageLimits::default()
@@ -795,9 +794,9 @@ fn disconnected_branches_compare_recent_work_with_native_freshness() {
 fn slow_rolling_window_matches_cold_recovery_and_reorg() {
     let (original, signer, payments, dir) = setup();
     let mut profile = original.profile.clone();
-    profile.manifest.share_window = 12;
-    profile.manifest.lifetime = 8;
-    profile.protocol = id(&profile.manifest).unwrap();
+    profile.share_window = 12;
+    profile.lifetime = 8;
+
     let chain = original.chain.clone();
     drop(original);
     let path = dir.path().join("slow");
@@ -805,7 +804,7 @@ fn slow_rolling_window_matches_cold_recovery_and_reorg() {
         heads: 1,
         ..Default::default()
     };
-    let mut store = Store::open(&path, profile.protocol, limits.clone()).unwrap();
+    let mut store = Store::open(&path, profile.pool_id, limits.clone()).unwrap();
     store.bind_wallet(signer.account()).unwrap();
     let mut node = Node::start(chain.clone(), profile.clone(), store, Limits::default()).unwrap();
     let mut tip = [0; 32];
@@ -845,7 +844,7 @@ fn slow_rolling_window_matches_cold_recovery_and_reorg() {
         Err(Error::Unavailable(_))
     ));
     drop(node);
-    let store = Store::open(&path, profile.protocol, limits).unwrap();
+    let store = Store::open(&path, profile.pool_id, limits).unwrap();
     let mut cold = Node::start(chain, profile, store, Limits::default()).unwrap();
     let result = cold.prepare_recovery().unwrap().unwrap().run();
     let result = cold.finish_recovery(result);
@@ -876,7 +875,7 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
     let tip = share(&mut source, &signer, &payments).0;
     let store = Store::open(
         &dir.path().join("leases"),
-        source.profile.protocol,
+        source.profile.pool_id,
         StorageLimits::default(),
     )
     .unwrap();
@@ -991,7 +990,7 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
     );
     let path = target.store.path().to_owned();
     drop(target);
-    let store = Store::open(&path, source.profile.protocol, StorageLimits::default()).unwrap();
+    let store = Store::open(&path, source.profile.pool_id, StorageLimits::default()).unwrap();
     let mut target = Node::start(
         source.chain.clone(),
         source.profile.clone(),
@@ -1012,4 +1011,83 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
             .unwrap(),
         deadline
     );
+}
+
+#[test]
+fn mined_work_and_signed_wallet_statements_cannot_be_relabelled_for_another_pool() {
+    let (mut node, wallet, payments, _dir) = setup();
+    let (tip, template) = share(&mut node, &wallet, &payments);
+    let bytes = node.store.read(Key::new(Kind::Core, tip)).unwrap();
+    let view = node.view().unwrap();
+    let work = Work::verify(&bytes, &view).unwrap();
+    let auth = wallet.authorize(tip).unwrap();
+    work.authorize(&auth, view.profile.pool_id).unwrap();
+    let mut other_profile = node.profile.clone();
+    other_profile.pool_id[0] ^= 1;
+    let other = View::pin(&node.chain, other_profile, view.now).unwrap();
+    assert!(Work::verify(&bytes, &other).is_err());
+    assert!(work.authorize(&auth, other.profile.pool_id).is_err());
+    let mut core: Core = decode(&bytes).unwrap();
+    let mut job: Job = decode(&core.job.0).unwrap();
+    job.pool_id = other.profile.pool_id;
+    core.job = Blob(encode(&job).unwrap());
+    assert!(matches!(
+        Work::verify(&encode(&core).unwrap(), &other),
+        Err(Error::Invalid("job offset binding"))
+    ));
+
+    let mut registration: Registration = decode(
+        &node
+            .store
+            .read(Key::new(Kind::Registration, template.job.registration))
+            .unwrap(),
+    )
+    .unwrap();
+    let public = crate::native::public_key(wallet.account()).unwrap();
+    assert!(crate::native::signature_valid(
+        registration.signature,
+        id(&registration.fields).unwrap(),
+        &public
+    ));
+    let inventory: Inventory = decode(
+        &node
+            .store
+            .read(Key::new(Kind::Inventory, registration.fields.inventory))
+            .unwrap(),
+    )
+    .unwrap();
+    registration.fields.pool_id = other.profile.pool_id;
+    assert!(!crate::native::signature_valid(
+        registration.signature,
+        id(&registration.fields).unwrap(),
+        &public
+    ));
+    let coupon: Coupon = decode(
+        &node
+            .store
+            .read(Key::new(Kind::Coupon, inventory.rows.0[0].coupon_ids.0[0]))
+            .unwrap(),
+    )
+    .unwrap();
+    let kernel = crate::native::reward(&coupon).unwrap().1;
+    let public = kernel
+        .excess
+        .to_pubkey(&grin_util::static_secp_instance().lock())
+        .unwrap();
+    let mut fields = CouponAuth {
+        pool_id: view.profile.pool_id,
+        owner: wallet.account(),
+        reward_id: id(&coupon.reward).unwrap(),
+    };
+    assert!(crate::native::signature_valid(
+        coupon.owner_auth,
+        id(&fields).unwrap(),
+        &public
+    ));
+    fields.pool_id = other.profile.pool_id;
+    assert!(!crate::native::signature_valid(
+        coupon.owner_auth,
+        id(&fields).unwrap(),
+        &public
+    ));
 }

@@ -23,13 +23,13 @@ impl<S: Source> Validator<'_, '_, S> {
         if core.job.uncles.0.is_empty() {
             return Ok(vec![]);
         }
-        if core.job.uncles.0.len() > usize::from(self.view.profile.manifest.max_uncles) {
+        if core.job.uncles.0.len() > usize::from(self.view.profile.max_uncles) {
             return Err(Error::Invalid("too many uncles"));
         }
         let mut ancestors = Vec::new();
         let mut cursor = self.parent(core)?;
         let mut ids = BTreeSet::new();
-        let depth = usize::from(self.view.profile.manifest.uncle_depth);
+        let depth = usize::from(self.view.profile.uncle_depth);
         for _ in 0..depth {
             let ancestor = match cursor {
                 Some(a) => a,
@@ -237,7 +237,7 @@ impl<S: Source> Validator<'_, '_, S> {
         }
         let mark = self.traces.len();
         let r: Registration = self.object(work.job.registration)?;
-        if r.fields.protocol != self.view.profile.protocol
+        if r.fields.pool_id != self.view.profile.pool_id
             || r.fields.owner != work.job.account
             || r.fields.birth != work.job.anchor
         {
@@ -249,10 +249,10 @@ impl<S: Source> Validator<'_, '_, S> {
             return Err(Error::Invalid("registration signature"));
         }
         let inv: Inventory = self.object(r.fields.inventory)?;
-        if inv.protocol != r.fields.protocol || inv.owner != r.fields.owner {
+        if inv.owner != r.fields.owner {
             return Err(Error::Invalid("inventory context"));
         }
-        let base = (self.view.profile.manifest.unit_budget.ilog2() + 1) as usize;
+        let base = (self.view.profile.unit_budget.ilog2() + 1) as usize;
         if inv.rows.0.len() != base + 3 {
             return Err(Error::Invalid("inventory row count"));
         }

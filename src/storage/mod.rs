@@ -71,7 +71,7 @@ pub struct Store {
     runtime: RuntimeStore,
     snapshot: Option<Arc<RuntimeSnapshot>>,
     compaction_cursor: Arc<std::sync::Mutex<Option<(RoutingKey, Id)>>>,
-    protocol: Id,
+    pool_id: Id,
     limits: StorageLimits,
 }
 #[derive(Clone)]
@@ -80,7 +80,7 @@ pub(crate) struct ReadSource {
     deadline: std::time::Instant,
     path: PathBuf,
     native: Option<(Arc<grin_chain::Chain>, crate::native::Profile)>,
-    protocol: Id,
+    pool_id: Id,
     limits: StorageLimits,
     runtime: RuntimeStore,
     snapshot: Arc<RuntimeSnapshot>,
@@ -99,13 +99,13 @@ impl ReadSource {
             runtime: self.runtime.clone(),
             snapshot: Some(self.snapshot.clone()),
             compaction_cursor: self.compaction_cursor.clone(),
-            protocol: self.protocol,
+            pool_id: self.pool_id,
             limits: self.limits.clone(),
         })
     }
 }
 pub(crate) struct Compaction {
-    protocol: Id,
+    pool_id: Id,
     anchor: Anchor,
     entries: Vec<(Key, Id, Vec<u8>)>,
     next_cursor: Option<(RoutingKey, Id)>,
@@ -156,7 +156,7 @@ fn now() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 impl Store {
-    pub fn open(path: &Path, protocol: Id, limits: StorageLimits) -> Result<Self> {
+    pub fn open(path: &Path, pool_id: Id, limits: StorageLimits) -> Result<Self> {
         let map_bytes = usize::try_from(
             limits
                 .bytes
@@ -168,7 +168,7 @@ impl Store {
         let mut index = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
             map_bytes,
-            protocol,
+            pool_id,
         )
         .map_err(runtime_error)?;
         index.set_byte_limit(limits.bytes);
@@ -190,7 +190,7 @@ impl Store {
             runtime,
             snapshot: None,
             compaction_cursor: Arc::new(std::sync::Mutex::new(None)),
-            protocol,
+            pool_id,
             limits,
         })
     }
@@ -229,7 +229,7 @@ impl Store {
                 .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30)),
             path: self.path.clone(),
             native: self.native.clone(),
-            protocol: self.protocol,
+            pool_id: self.pool_id,
             limits: self.limits.clone(),
             runtime: self.runtime.clone(),
             snapshot,
@@ -267,16 +267,16 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    pub fn protocol(&self) -> Id {
-        self.protocol
+    pub fn pool_id(&self) -> Id {
+        self.pool_id
     }
     pub fn attach_native(
         &mut self,
         chain: Arc<grin_chain::Chain>,
         profile: crate::native::Profile,
     ) -> Result<()> {
-        if profile.protocol != self.protocol {
-            return Err(Error::Invalid("native store protocol"));
+        if profile.pool_id != self.pool_id {
+            return Err(Error::Invalid("native store pool identity"));
         }
         self.native = Some((chain, profile));
         Ok(())
@@ -688,7 +688,7 @@ impl Store {
         view: &crate::native::View<'_>,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Compaction> {
-        if view.profile.protocol != self.protocol {
+        if view.profile.pool_id != self.pool_id {
             return Err(Error::View);
         }
         let mut entries = Vec::new();
@@ -747,7 +747,7 @@ impl Store {
             next_cursor = None;
         }
         Ok(Compaction {
-            protocol: self.protocol,
+            pool_id: self.pool_id,
             anchor: view.head.clone(),
             entries,
             next_cursor,
@@ -755,7 +755,7 @@ impl Store {
     }
     pub(crate) fn apply_compaction(&mut self, plan: Compaction) -> Result<usize> {
         self.check_writer()?;
-        if plan.protocol != self.protocol {
+        if plan.pool_id != self.pool_id {
             return Err(Error::View);
         }
         self.check_native(&plan.anchor)?;

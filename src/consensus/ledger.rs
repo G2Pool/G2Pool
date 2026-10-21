@@ -275,7 +275,7 @@ impl<S: Source> Validator<'_, '_, S> {
                 .iter()
                 .map(|work| {
                     let mut cursor = core.job().parent.clone();
-                    for depth in 1..=usize::from(self.view.profile.manifest.uncle_depth) {
+                    for depth in 1..=usize::from(self.view.profile.uncle_depth) {
                         let Parent::Receipt(id) = cursor else { break };
                         let ancestor = self
                             .facts

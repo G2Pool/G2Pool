@@ -172,45 +172,15 @@ impl Field for Option<Id> {
     }
 }
 pub const COUPON_LEAVES_PER_ROW: usize = 12;
-record!(Limits {
-    work_core: u32,
-    coupon: u32,
-    inventory: u32,
-    registration: u32,
-    finder_output: u32,
-    payout_record: u32,
-    kernel_encoding_plan: u32,
-    transaction_only: u32,
-    residual_body: u32
-});
-record!(Manifest {
-    network: u8,
-    genesis: Id,
-    grin_version: [u8; 10],
-    subsidy: u64,
-    finder_floor: u64,
-    unit_budget: u16,
-    share_divisor: u64,
-    share_target_seconds: u16,
-    share_window: u32,
-    lifetime: u64,
-    leaves_per_row: u8,
-    uncle_depth: u8,
-    max_uncles: u8,
-    future_seconds: u32,
-    edge_bits: u8,
-    proof_size: u16,
-    limits: Limits
-});
 record!(Reward { output:Blob<2048>, kernel:Blob<256> });
 record!(Coupon {
     reward: Reward,
     owner_auth: Sig
 });
 record!(InventoryRow { family:u8, row:u8, coupon_ids:List<Id,COUPON_LEAVES_PER_ROW> });
-record!(Inventory { protocol:Id, owner:Point, rows:List<InventoryRow,14> });
+record!(Inventory { owner:Point, rows:List<InventoryRow,14> });
 record!(RegistrationAuth {
-    protocol: Id,
+    pool_id: Id,
     owner: Point,
     inventory: Id,
     birth: Anchor,
@@ -221,14 +191,11 @@ record!(Registration {
     signature: Sig
 });
 record!(CouponAuth {
-    protocol: Id,
+    pool_id: Id,
     owner: Point,
     reward_id: Id
 });
-record!(WorkAuthMessage {
-    protocol: Id,
-    work_id: Id
-});
+record!(WorkAuthMessage { work_id: Id });
 record!(WorkAuthorization {
     fields: WorkAuthMessage,
     signature: Sig
@@ -243,21 +210,21 @@ record!(ReceiptRow {
 record!(Outcome { family:u8, row:u8, leaf:u8, coupon:Option<Id>, code:u8, value:u64 });
 record!(AccountRow { account:Point, registration:Id, canonical_units:u16, uncle_units:u16,
     base_units:u16, residual_units:u8, outcomes:List<Outcome,14> });
-record!(PayoutRecord { protocol:Id, anchor:Anchor, parent:Parent, receipts:List<ReceiptRow,MAX_ENCODING_ENTRIES>,
+record!(PayoutRecord { anchor:Anchor, parent:Parent, receipts:List<ReceiptRow,MAX_ENCODING_ENTRIES>,
     accounts:List<AccountRow,MAX_ENCODING_ENTRIES>, paid:u64, finder:u64 });
 record!(EncodingEntry {
     account: Point,
     encoding: Encoding
 });
-record!(EncodingPlan { protocol:Id, entries:List<EncodingEntry,MAX_ENCODING_ENTRIES> });
-record!(TxOnly { protocol:Id, native:Blob<8388608> });
-record!(Kernel { protocol:Id, native:Blob<256> });
-record!(FinderOutput { protocol:Id, output:Blob<2048> });
-record!(Job { protocol:Id, anchor:Anchor, timestamp:i64, parent:Parent, account:Point,
+record!(EncodingPlan { entries:List<EncodingEntry,MAX_ENCODING_ENTRIES> });
+record!(TxOnly { native:Blob<8388608> });
+record!(Kernel { native:Blob<256> });
+record!(FinderOutput { output:Blob<2048> });
+record!(Job { pool_id:Id, anchor:Anchor, timestamp:i64, parent:Parent, account:Point,
     registration:Id, difficulty:u64, uncles:List<Id,8>, transaction_only:Id,
     kernel_encoding_plan:Id, finder_value:u64, finder_commitment:Point, finder_output:Id });
 record!(Core { header:Blob<4096>, job:Blob<2048> });
-record!(Residual { protocol:Id, finder_kernel:Blob<256>, binding_kernel:Blob<256>,
+record!(Residual { finder_kernel:Blob<256>, binding_kernel:Blob<256>,
     aggregate_kernels:List<Blob<256>,256> });
 
 pub trait Object: Field {
@@ -269,7 +236,7 @@ macro_rules! object {
         const DOMAIN: &'static str = $d; const MAX: usize = $m;
     })*};
 }
-object!(Manifest=> ("PROTOCOL",512),Reward=> ("REWARD",4096),Coupon=> ("COUPON",2048),
+object!(Reward=> ("REWARD",4096),Coupon=> ("COUPON",2048),
     Inventory=> ("INVENTORY",262144),RegistrationAuth=> ("REGISTRATION_AUTH",192),
     Registration=> ("REGISTRATION",256),WorkAuthMessage=> ("WORK_AUTH",128),
     WorkAuthorization=> ("WORK_AUTHORIZATION",192),CouponAuth=> ("COUPON_AUTH",128),
@@ -312,11 +279,11 @@ pub fn hash(domain: &str, bytes: &[u8]) -> Id {
 pub fn id<T: Object>(value: &T) -> Result<Id> {
     Ok(hash(T::DOMAIN, &encode(value)?))
 }
-pub fn scalar(protocol: Id, job: Id) -> Result<[u8; 32]> {
+pub fn scalar(job: Id) -> Result<[u8; 32]> {
     let handle = grin_util::static_secp_instance();
     let secp = handle.lock();
     for counter in 0u32..256 {
-        let payload = [protocol.as_slice(), job.as_slice(), &counter.to_be_bytes()].concat();
+        let payload = [job.as_slice(), &counter.to_be_bytes()].concat();
         let digest = hash("JOB_SCALAR", &payload);
         if grin_util::secp::key::SecretKey::from_slice(&secp, &digest).is_ok() {
             return Ok(digest);
@@ -332,7 +299,6 @@ pub fn roundtrip(domain: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         };
     }
     match domain {
-        "PROTOCOL" => go!(Manifest),
         "REWARD" => go!(Reward),
         "COUPON" => go!(Coupon),
         "INVENTORY" => go!(Inventory),
