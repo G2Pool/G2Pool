@@ -31,7 +31,7 @@ pub struct Book {
     generation: u64,
     saved: u64,
     local: bool,
-    archive: Option<crate::storage::sharechain::SharechainDb>,
+    database: Option<crate::storage::sharechain::SharechainDb>,
     peers: BTreeMap<SocketAddr, Peer>,
     pub(crate) bans: super::bans::IpBans,
 }
@@ -86,13 +86,13 @@ impl Book {
             generation: 1,
             saved: 0,
             local,
-            archive: None,
+            database: None,
             peers: BTreeMap::new(),
             bans: super::bans::IpBans::default(),
         }
     }
 
-    fn from_archive(
+    fn from_database(
         sharechain: crate::storage::sharechain::SharechainDb,
         local: bool,
         seeds: &[SocketAddr],
@@ -186,7 +186,7 @@ impl Book {
             generation: 1,
             saved: 0,
             local,
-            archive: Some(sharechain),
+            database: Some(sharechain),
             peers,
             bans: super::bans::IpBans::default(),
         };
@@ -205,7 +205,7 @@ impl Book {
         if store.protocol() != protocol {
             return Err(Error::Invalid("peer database identity"));
         }
-        Self::from_archive(store.archive(), local, seeds)
+        Self::from_database(store.database(), local, seeds)
     }
     pub fn seed(&mut self, addr: SocketAddr) -> Result<()> {
         let addr = crate::network::normalize(addr);
@@ -425,7 +425,7 @@ impl Book {
             return None;
         }
         Some(Persistence {
-            archive: self.archive.clone()?,
+            database: self.database.clone()?,
             generation: self.generation,
             peers: self.peers.clone(),
         })
@@ -436,13 +436,13 @@ impl Book {
 }
 
 pub struct Persistence {
-    archive: crate::storage::sharechain::SharechainDb,
+    database: crate::storage::sharechain::SharechainDb,
     generation: u64,
     peers: BTreeMap<SocketAddr, Peer>,
 }
 impl Persistence {
     pub fn write(self) -> Result<u64> {
-        let runtime = &self.archive;
+        let runtime = &self.database;
         let mut desired = Vec::with_capacity(self.peers.len());
         for (address, peer) in self.peers {
             let endpoint = address.to_string();

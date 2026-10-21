@@ -192,6 +192,7 @@ record!(Manifest {
     unit_budget: u16,
     share_divisor: u64,
     share_target_seconds: u16,
+    share_window: u32,
     lifetime: u64,
     leaves_per_row: u8,
     uncle_depth: u8,

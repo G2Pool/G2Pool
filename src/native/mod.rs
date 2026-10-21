@@ -1,13 +1,10 @@
 mod profile;
+pub(crate) use profile::MAX_ANCHOR_TIMESTAMP_DEVIATION;
 pub use profile::{
     default_limits, manifest, payout_precision, Profile, NATIVE_CODEC, NATIVE_VERSION,
 };
 
-use crate::{
-    codec::*,
-    objects::{Key, Kind},
-    Error, Result,
-};
+use crate::{codec::*, Error, Result};
 use grin_chain::{pipe, txhashset, Chain};
 use grin_core::core::committed::Committed;
 use grin_core::core::hash::{Hash, Hashed};
@@ -240,21 +237,11 @@ pub struct Work {
 pub(crate) fn authenticated_history<F>(
     view: &View<'_>,
     parent: &Parent,
-    mut read: F,
+    mut load: F,
 ) -> Result<Vec<(u64, u128)>>
 where
-    F: FnMut(Key) -> Result<Arc<[u8]>>,
+    F: FnMut(Id) -> Result<Arc<Work>>,
 {
-    let load = |id: Id, read: &mut F| -> Result<Work> {
-        let bytes = read(Key::new(Kind::Core, id))?;
-        let work = Work::verify(&bytes, view)?;
-        if work.id() != id {
-            return Err(Error::Invalid("retarget work identity"));
-        }
-        let auth: WorkAuthorization = decode(&read(Key::new(Kind::Authorization, id))?)?;
-        work.authorize(&auth, view.profile.protocol)?;
-        Ok(work)
-    };
     let mut cursor = match parent {
         Parent::Root(anchor) => {
             view.anchor(anchor)?;
@@ -271,10 +258,10 @@ where
         if !primary.insert(id) {
             return Err(Error::Invalid("retarget ancestry cycle"));
         }
-        let work = load(id, &mut read)?;
+        let work = load(id)?;
         if spine
             .last()
-            .is_some_and(|child: &Work| work.job.anchor.height > child.job.anchor.height)
+            .is_some_and(|child: &Arc<Work>| work.job.anchor.height > child.job.anchor.height)
         {
             return Err(Error::Invalid("retarget anchor regression"));
         }
@@ -297,7 +284,7 @@ where
             if !credited.insert(uncle) {
                 return Err(Error::Invalid("retarget duplicate uncle"));
             }
-            let uw = load(uncle, &mut read)?;
+            let uw = load(uncle)?;
             let uj = uw.job();
             if !ancestors.iter().any(|ancestor| {
                 ancestor.job.anchor == uj.anchor && ancestor.job.parent == uj.parent
@@ -377,13 +364,6 @@ impl Work {
         Ok(())
     }
     pub fn verify(bytes: &[u8], view: &View<'_>) -> Result<Self> {
-        Self::verify_with_target(bytes, view, None)
-    }
-    pub(crate) fn verify_with_target(
-        bytes: &[u8],
-        view: &View<'_>,
-        assigned: Option<u64>,
-    ) -> Result<Self> {
         let core: Core = decode(bytes)?;
         let job: Job = decode(&core.job.0)?;
         let header: BlockHeader = parse(&core.header.0)?;
@@ -400,12 +380,9 @@ impl Work {
         }
         let parent = view.anchor(&job.anchor)?;
         let target = view.target(&job.anchor)?;
-        let d = assigned.unwrap_or(job.difficulty);
+        let d = job.difficulty;
         if d < consensus::graph_weight(header.height, view.profile.manifest.edge_bits) {
             return Err(Error::Invalid("assigned graph weight"));
-        }
-        if assigned.is_some() && d != job.difficulty {
-            return Err(Error::Invalid("assigned target"));
         }
         if header.prev_hash != parent.hash()
             || header.height

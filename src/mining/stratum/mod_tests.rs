@@ -76,7 +76,7 @@ fn submitted_job_keeps_dependencies_after_its_advertised_lease_expires() {
     let proof = template.block.header.pow.proof.clone();
     let height = template.block.header.height;
     let nonce = template.block.header.pow.nonce;
-    let db = node.store.archive();
+    let db = node.store.database();
     let node = Arc::new(Mutex::new(node));
     let mining = Mining::bounded(node, Arc::new(signer), Retention::default()).unwrap();
     let job = mining.publish(template).unwrap();

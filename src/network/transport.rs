@@ -43,7 +43,7 @@ fn swarm(
 ) -> Result<Swarm<Behaviour>> {
     let schema = hash(
         "POOL_WIRE_SCHEMA",
-        b"heads;hello-port;peers;notice;ack;busy;get;partitioned-reply;typed-lengths;locator;target-pinned-compact-pages-v2;body-hydration",
+        b"heads;hello-port;peers;notice;ack;busy;get;partitioned-reply;typed-lengths;rolling-sharechain",
     );
     let mut prologue = b"G2Pool transport\0".to_vec();
     prologue.extend(protocol);
@@ -966,36 +966,6 @@ fn handle_rpc(
                                     .heads
                                     .clone(),
                             ),
-                            Message::Locator {
-                                target,
-                                start,
-                                locator,
-                            } => {
-                                let snapshot = node
-                                    .sharechain
-                                    .db()
-                                    .read()
-                                    .map_err(|_| Error::Invalid("sharechain snapshot"))?;
-                                let common = if start == [0; 32] {
-                                    super::chain_sync::common_ancestor(&snapshot, target, &locator)?
-                                } else {
-                                    super::chain_sync::ChainIndex::header(&snapshot, start)?
-                                };
-                                let Some(common) = common else {
-                                    return Ok(Message::Busy);
-                                };
-                                let page = super::chain_sync::header_range(
-                                    &snapshot,
-                                    target,
-                                    common.id,
-                                    super::chain_sync::MAX_HEADERS,
-                                )?;
-                                Message::Headers {
-                                    target,
-                                    start,
-                                    headers: page.headers,
-                                }
-                            }
                             Message::Peers => {
                                 let mut addresses = node.peers.addresses();
                                 addresses.retain(|address| connected.get(address) != Some(&peer));

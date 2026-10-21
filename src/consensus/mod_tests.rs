@@ -1,6 +1,80 @@
 use super::*;
 
 #[test]
+fn traversal_and_ledger_payout_windows_stop_when_an_uncle_fills_the_budget() {
+    let (node, _signer, _payments, _dir) = crate::node::tests::setup();
+    let view = node.view().unwrap();
+    let mut facts = Facts::default();
+    for (n, difficulty) in [(1, 7), (2, 4), (3, 6)] {
+        let id = [n; 32];
+        let work = Work {
+            id,
+            job: Job {
+                protocol: view.profile.protocol,
+                anchor: view.head.clone(),
+                timestamp: 0,
+                parent: if n == 3 {
+                    Parent::Receipt([1; 32])
+                } else {
+                    Parent::Root(view.head.clone())
+                },
+                account: [0; 33],
+                registration: [0; 32],
+                difficulty,
+                uncles: List(if n == 3 { vec![[2; 32]] } else { vec![] }),
+                transaction_only: [0; 32],
+                kernel_encoding_plan: [0; 32],
+                finder_value: 1,
+                finder_commitment: [0; 33],
+                finder_output: [0; 32],
+            },
+            header: Default::default(),
+        };
+        facts.work.insert(id, Arc::new(work));
+        facts.targets.insert(id, Trace::target(id));
+        for kind in [Kind::Core, Kind::Authorization] {
+            let key = Key::new(kind, id);
+            facts.loaded.insert(key, Arc::from([n]));
+            facts.leaves.insert(key, Trace::leaf(key));
+        }
+    }
+    facts.recount();
+    let mut builder =
+        Validator::bounded(&node.store, &view, node.limits.clone(), node.cancel.clone());
+    builder.seed(&facts);
+    let mut ledger = Ledger::new(view.head.height);
+    for id in [[3; 32], [1; 32]] {
+        ledger
+            .append(builder.frame(facts.work[&id].clone()).unwrap())
+            .unwrap();
+    }
+    for cached in [false, true] {
+        let mut validator =
+            Validator::bounded(&node.store, &view, node.limits.clone(), node.cancel.clone());
+        validator.seed(&facts);
+        if cached {
+            validator.facts.topology = Some(Arc::new(ledger.clone()));
+        }
+        let entries = validator
+            .contributions_bounded(
+                &Parent::Receipt([3; 32]),
+                view.head.height,
+                Some(8),
+                Some(10),
+                Some(8),
+            )
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(work, class)| (work.id(), *class))
+                .collect::<Vec<_>>(),
+            vec![([3; 32], 0), ([2; 32], 1)]
+        );
+    }
+}
+
+#[test]
 fn facts_clone_shares_maps_and_retention_is_snapshot_independent() {
     let kept = Key::new(Kind::Core, [1; 32]);
     let removed = Key::new(Kind::Core, [2; 32]);
@@ -223,6 +297,7 @@ impl Facts {
         self.certificate_bytes = self
             .completed
             .values()
+            .chain(self.targets.values())
             .map(|trace| trace.own_metadata())
             .sum();
     }

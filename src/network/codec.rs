@@ -89,8 +89,6 @@ async fn frame<T: AsyncRead + Unpin + Send>(
         1 | 8 => 2050,
         2 => 1058,
         7 => 1042,
-        11 => super::chain_sync::LOCATOR_FRAME,
-        12 => super::chain_sync::HEADERS_FRAME,
         3 => FRAME,
         _ => return Err(invalid()),
     };
@@ -123,7 +121,7 @@ impl rpc::Codec for Codec {
             if self.bulk {
                 tag == 2
             } else {
-                matches!(tag, 0 | 5 | 6 | 8 | 11)
+                matches!(tag, 0 | 5 | 6 | 8)
             }
         })
         .await?;

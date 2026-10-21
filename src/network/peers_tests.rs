@@ -154,7 +154,6 @@ fn malformed_routing_rows_do_not_recreate_wallet_state() {
     let sharechain = crate::storage::sharechain::SharechainDb::open(
         &path.with_extension("sharechain"),
         crate::storage::sharechain::MAP_BYTES,
-        crate::storage::sharechain::MAX_RECORD_BYTES,
         [1; 32],
     )
     .unwrap();
@@ -199,11 +198,10 @@ impl Book {
         let sharechain = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
             crate::storage::sharechain::MAP_BYTES,
-            crate::storage::sharechain::MAX_RECORD_BYTES,
             protocol,
         )
         .map_err(|_| Error::Invalid("peer database identity"))?;
-        Self::from_archive(sharechain, local, seeds)
+        Self::from_database(sharechain, local, seeds)
     }
 
     fn learn(&mut self, addr: SocketAddr) -> Result<bool> {

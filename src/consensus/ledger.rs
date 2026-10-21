@@ -1,21 +1,29 @@
 use super::*;
-use im::{OrdMap, OrdSet, Vector};
+use im::{OrdSet, Vector};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WindowLimits {
+    pub(super) primary_limit: usize,
+    pub(super) receipt_limit: usize,
+    pub(super) work_limit: Option<u128>,
+}
 
 #[derive(Clone, Copy)]
-pub(super) struct Contribution {
+pub(crate) struct Contribution {
     pub id: Id,
     pub height: u64,
     pub timestamp: u64,
     pub difficulty: u64,
     pub class: u8,
+    pub depth: usize,
 }
 
-pub(super) struct Frame {
+pub(crate) struct Frame {
     primary: Contribution,
     uncles: Vec<Contribution>,
     pub parent: Option<Id>,
-    pub trace: Arc<Trace>,
-    pub financial_trace: Arc<Trace>,
+    pub(super) trace: Arc<Trace>,
+    pub(super) financial_trace: Arc<Trace>,
 }
 impl Frame {
     pub fn id(&self) -> Id {
@@ -27,6 +35,15 @@ impl Frame {
     pub fn contributions(&self) -> impl Iterator<Item = &Contribution> {
         std::iter::once(&self.primary).chain(self.uncles.iter())
     }
+    pub fn credited(
+        &self,
+        index: usize,
+        limit: usize,
+        low: u64,
+    ) -> impl Iterator<Item = &Contribution> {
+        self.contributions()
+            .filter(move |entry| index + entry.depth < limit && entry.height >= low)
+    }
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + 2 * std::mem::size_of::<usize>()
@@ -37,15 +54,12 @@ impl Frame {
 }
 
 #[derive(Default, Clone)]
-pub(super) struct Ledger {
+pub(crate) struct Ledger {
     pub height: u64,
-    low: u64,
     pub frames: Vector<Arc<Frame>>,
     spine: OrdSet<Id>,
     seen: OrdSet<Id>,
-    active: OrdMap<(u64, Id), Contribution>,
     pub boundary: Option<Id>,
-    pub score: u128,
     frame_bytes: usize,
     window_order: Vector<Contribution>,
     window_cache: Option<WindowCache>,
@@ -54,39 +68,46 @@ pub(super) struct Ledger {
 #[derive(Clone)]
 struct WindowCache {
     low: u64,
-    limits: window::WindowLimits,
+    limits: WindowLimits,
     ids: Vec<Id>,
 }
 impl Ledger {
-    pub fn new(height: u64, low: u64) -> Self {
+    pub fn new(height: u64) -> Self {
         Self {
             height,
-            low,
             ..Self::default()
         }
     }
     pub fn contains(&self, id: &Id) -> bool {
         self.spine.contains(id)
     }
-    pub fn full(&self) -> BTreeSet<Id> {
-        self.active.values().map(|entry| entry.id).collect()
+    pub fn full(&self, low: u64) -> BTreeSet<Id> {
+        self.window_order
+            .iter()
+            .filter(|entry| entry.height >= low)
+            .map(|entry| entry.id)
+            .collect()
     }
-    pub fn validation(&self, limit: usize) -> BTreeSet<Id> {
-        if limit == usize::MAX {
-            return self.full();
+    pub fn trim(&mut self, limit: usize) {
+        while self.frames.len() > limit {
+            let frame = self.frames.pop_back().expect("nonempty ledger");
+            self.boundary = Some(frame.id());
+            self.remove_order_back(&frame);
+            self.undo(&frame);
         }
-        let mut selected = BTreeSet::new();
-        for frame in &self.frames {
-            for entry in frame.contributions() {
-                if entry.height >= self.low && selected.len() < limit {
-                    selected.insert(entry.id);
-                }
-            }
-            if selected.len() >= limit {
-                break;
-            }
-        }
-        selected
+    }
+    pub fn recent(&self, limit: usize, low: u64) -> impl Iterator<Item = &Contribution> {
+        self.frames
+            .iter()
+            .take(limit)
+            .enumerate()
+            .flat_map(move |(index, frame)| frame.credited(index, limit, low))
+    }
+    pub fn window_score(&self, limit: usize, low: u64) -> Result<u128> {
+        self.recent(limit, low).try_fold(0u128, |sum, entry| {
+            sum.checked_add(u128::from(entry.difficulty))
+                .ok_or(Error::Invalid("score overflow"))
+        })
     }
     pub fn primary(&self) -> BTreeSet<Id> {
         self.spine.iter().copied().collect()
@@ -96,67 +117,18 @@ impl Ledger {
             + self.frames.len() * std::mem::size_of::<Arc<Frame>>()
             + self.frame_bytes
             + (self.spine.len() + self.seen.len()) * 96
-            + self.active.len() * 192
             + self.window_order.len() * std::mem::size_of::<Contribution>()
-    }
-
-    pub fn retarget_history(&self, limit: usize) -> Result<Vec<(u64, u128)>> {
-        let mut total = 0u128;
-        let mut samples = Vec::new();
-        for frame in self.frames.iter().take(limit).rev() {
-            let parent_total = total;
-            let uncle_work = frame
-                .uncles
-                .iter()
-                .try_fold(0u128, |sum, uncle| {
-                    sum.checked_add(u128::from(uncle.difficulty))
-                })
-                .ok_or(Error::Invalid("retarget work overflow"))?;
-            total = parent_total
-                .checked_add(u128::from(frame.primary.difficulty))
-                .and_then(|value| value.checked_add(uncle_work))
-                .ok_or(Error::Invalid("retarget work overflow"))?;
-            samples.push((frame.primary.timestamp, total));
-            for uncle in &frame.uncles {
-                let uncle_total = parent_total
-                    .checked_add(u128::from(uncle.difficulty))
-                    .ok_or(Error::Invalid("retarget work overflow"))?;
-                samples.push((uncle.timestamp, uncle_total));
-            }
-        }
-        Ok(samples)
-    }
-
-    pub fn can_retarget(&self, limit: usize) -> bool {
-        (self.frames.len() >= limit || self.boundary.is_none())
-            && self
-                .frames
-                .iter()
-                .take(limit)
-                .all(|frame| frame.uncles.is_empty())
     }
 
     fn insert(&mut self, frame: &Frame) -> Result<()> {
         let mut unique = BTreeSet::new();
-        let mut score = self.score;
         for entry in frame.contributions() {
             if self.seen.contains(&entry.id) || !unique.insert(entry.id) {
                 return Err(Error::Invalid("duplicate contribution"));
             }
-            if entry.height >= self.low {
-                score = score
-                    .checked_add(entry.difficulty as u128)
-                    .ok_or(Error::Invalid("score overflow"))?;
-            }
         }
         self.seen.extend(unique);
         self.spine.insert(frame.id());
-        self.score = score;
-        for entry in frame.contributions() {
-            if entry.height >= self.low {
-                self.active.insert((entry.height, entry.id), *entry);
-            }
-        }
         self.window_cache = None;
         Ok(())
     }
@@ -182,7 +154,7 @@ impl Ledger {
             debug_assert_eq!(actual.id, expected.id);
         }
     }
-    pub(super) fn window_ids(&mut self, low: u64, limits: window::WindowLimits) -> Result<Vec<Id>> {
+    pub(super) fn window_ids(&mut self, low: u64, limits: WindowLimits) -> Result<Vec<Id>> {
         if let Some(cache) = &self.window_cache {
             if cache.low == low && cache.limits == limits {
                 return Ok(cache.ids.clone());
@@ -257,19 +229,20 @@ impl Ledger {
         self.frames.push_front(frame);
         Ok(())
     }
-    fn deactivate(&mut self, contribution: &Contribution) {
-        if let Some(entry) = self.active.remove(&(contribution.height, contribution.id)) {
-            self.score -= entry.difficulty as u128;
-        }
-    }
     fn undo(&mut self, frame: &Frame) {
         self.frame_bytes -= frame.bytes();
         self.spine.remove(&frame.id());
         for entry in frame.contributions() {
             self.seen.remove(&entry.id);
-            self.deactivate(entry);
         }
         self.window_cache = None;
+    }
+    pub fn rebase(&mut self, height: u64) -> Result<()> {
+        if height < self.height {
+            return Err(Error::View);
+        }
+        self.height = height;
+        Ok(())
     }
     pub fn rewind_to(&mut self, id: Id) {
         while self.frames.front().is_some_and(|frame| frame.id() != id) {
@@ -278,26 +251,6 @@ impl Ledger {
             self.undo(&frame);
         }
     }
-    pub fn advance(&mut self, height: u64, low: u64) -> Result<()> {
-        if height < self.height || low < self.low {
-            return Err(Error::View);
-        }
-        self.height = height;
-        self.low = low;
-        while self.frames.back().is_some_and(|frame| frame.height() < low) {
-            let frame = self.frames.pop_back().expect("nonempty ledger");
-            self.boundary = Some(frame.id());
-            self.remove_order_back(&frame);
-            self.undo(&frame);
-        }
-        while let Some(entry) = self.active.get_min().map(|(_, entry)| *entry) {
-            if entry.height >= low {
-                break;
-            }
-            self.deactivate(&entry);
-        }
-        Ok(())
-    }
 }
 
 impl<S: Source> Validator<'_, '_, S> {
@@ -305,7 +258,7 @@ impl<S: Source> Validator<'_, '_, S> {
         let uncles = self.uncles(&core)?;
         let financial_trace = Trace::join(self.traces.iter().cloned());
         let parent = self.parent(&core)?.map(|work| work.id());
-        let contribution = |work: &Work, class| -> Result<Contribution> {
+        let contribution = |work: &Work, class, depth| -> Result<Contribution> {
             Ok(Contribution {
                 id: work.id(),
                 height: work.job().anchor.height,
@@ -313,13 +266,30 @@ impl<S: Source> Validator<'_, '_, S> {
                     .map_err(|_| Error::Invalid("share timestamp"))?,
                 difficulty: work.job().difficulty,
                 class,
+                depth,
             })
         };
         Ok(Arc::new(Frame {
-            primary: contribution(&core, 0)?,
+            primary: contribution(&core, 0, 0)?,
             uncles: uncles
                 .iter()
-                .map(|work| contribution(work, 1))
+                .map(|work| {
+                    let mut cursor = core.job().parent.clone();
+                    for depth in 1..=usize::from(self.view.profile.manifest.uncle_depth) {
+                        let Parent::Receipt(id) = cursor else { break };
+                        let ancestor = self
+                            .facts
+                            .work(id)
+                            .ok_or(Error::Unavailable(Key::new(Kind::Core, id)))?;
+                        if ancestor.job().parent == work.job().parent
+                            && ancestor.job().anchor == work.job().anchor
+                        {
+                            return contribution(work, 1, depth);
+                        }
+                        cursor = ancestor.job().parent.clone();
+                    }
+                    Err(Error::Invalid("uncle depth"))
+                })
                 .collect::<Result<Vec<_>>>()?,
             parent,
             trace: Trace::join(self.traces.iter().cloned()),

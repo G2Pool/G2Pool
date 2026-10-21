@@ -7,7 +7,7 @@ pub use maintenance::{Maintenance, MaintenanceResult};
 
 use crate::{
     codec::*,
-    consensus::{Evaluation, EvaluationProgress, Facts, Validator},
+    consensus::{EvaluationProgress, Facts},
     limits::Limits,
     native::{Profile, View, Work},
     objects::{Key, Kind, Source},
@@ -40,7 +40,6 @@ pub struct Node {
     pub(crate) downloads: Arc<std::sync::Mutex<crate::network::download::Downloads>>,
     pub profile: Profile,
     pub store: Store,
-    pub(crate) sharechain: crate::consensus::coordinator::Coordinator,
     pub limits: Limits,
     pub cancel: Arc<AtomicBool>,
     pub(crate) peer_work: Arc<crate::limits::WorkSlots>,
@@ -50,7 +49,6 @@ pub struct Node {
     tasks: BTreeMap<Id, Acquisition>,
     running: BTreeMap<Id, Running>,
     warm: Option<(Anchor, Facts)>,
-    dependency_closure: Option<crate::consensus::VerifiedClosure>,
     recovery: VecDeque<(Id, Id)>,
     recovery_seen: BTreeSet<Id>,
     pub(crate) sync_cursor: Option<Id>,
@@ -121,7 +119,6 @@ impl Node {
             return Err(Error::Invalid("node protocol"));
         }
         store.attach_native(chain.clone(), profile.clone())?;
-        let sharechain = crate::consensus::coordinator::Coordinator::from_db(store.archive())?;
         let peers = crate::network::peers::Book::memory(profile.manifest.network >= 2);
         let mut node = Self {
             connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -135,7 +132,6 @@ impl Node {
             chain,
             profile,
             store,
-            sharechain,
             limits,
             cancel: Arc::new(AtomicBool::new(false)),
             peer_work: crate::limits::WorkSlots::new(2),
@@ -145,7 +141,6 @@ impl Node {
             tasks: BTreeMap::new(),
             running: BTreeMap::new(),
             warm: None,
-            dependency_closure: None,
             recovery: VecDeque::new(),
             recovery_seen: BTreeSet::new(),
             sync_cursor: None,
@@ -178,8 +173,7 @@ impl Node {
             }
             None => vec![],
         };
-        let recovering =
-            !self.recovery.is_empty() || (self.best.is_none() && !self.store.heads()?.is_empty());
+        let recovering = self.best.is_none() && !self.store.heads()?.is_empty();
         *self
             .published
             .write()
@@ -200,56 +194,13 @@ impl Node {
     pub fn revision(&self) -> Result<Revision> {
         self.store.revision()?.ok_or(Error::View)
     }
-    pub fn sharechain_publication(
-        &self,
-    ) -> Result<Option<crate::storage::sharechain::Publication>> {
-        self.sharechain
-            .db()
-            .read()
-            .map_err(|_| Error::Invalid("sharechain snapshot"))?
-            .publication()
-            .map_err(|_| Error::Invalid("sharechain publication"))
-    }
-    pub(crate) fn sharechain_locator(&self) -> Result<Option<Vec<Id>>> {
-        let snapshot = self
-            .sharechain
-            .db()
-            .read()
-            .map_err(|_| Error::Invalid("sharechain snapshot"))?;
-        let Some(publication) = snapshot
-            .publication()
-            .map_err(|_| Error::Invalid("sharechain publication"))?
-        else {
-            return Ok(None);
-        };
-        snapshot
-            .locator(publication.head, crate::network::chain_sync::MAX_LOCATOR)
-            .map(Some)
-            .map_err(|_| Error::Invalid("sharechain locator"))
-    }
-    pub(crate) fn compare_sharechain(
-        &self,
-        left: Id,
-        right: Id,
-    ) -> Result<Option<std::cmp::Ordering>> {
-        let snapshot = self
-            .sharechain
-            .db()
-            .read()
-            .map_err(|_| Error::Invalid("sharechain snapshot"))?;
-        snapshot
-            .compare_cumulative(left, right)
-            .map_err(|_| Error::Invalid("sharechain comparison"))
-    }
     fn prefer_candidate(&self, tip: Id, facts: &Facts, incumbent: Id) -> Result<bool> {
-        if self.sharechain.indexed(tip)? && self.sharechain.indexed(incumbent)? {
-            if let Some(ordering) = self.compare_sharechain(tip, incumbent)? {
-                return Ok(ordering.is_gt());
-            }
+        let (anchor, incumbent_facts) = self.warm.as_ref().ok_or(Error::View)?;
+        if *anchor != self.revision()?.anchor {
+            return Err(Error::View);
         }
-        let (result, incumbent_facts) = self.evaluate_cached(incumbent)?;
         Ok(matches!(
-            self.compare_verified_branches(tip, facts, result.tip, &incumbent_facts),
+            self.compare_verified_branches(tip, facts, incumbent, incumbent_facts),
             ForkComparison::PreferLeft
         ))
     }
@@ -283,6 +234,12 @@ impl Node {
         Ok(heads)
     }
 
+    pub(crate) fn knows_head(&self, tip: Id) -> bool {
+        self.validated.contains(&tip)
+            || self.warm.as_ref().is_some_and(|(_, facts)| {
+                facts.branch().is_some_and(|branch| branch.contains(&tip))
+            })
+    }
     pub(crate) fn compare_verified_branches(
         &self,
         left: Id,
@@ -290,226 +247,130 @@ impl Node {
         right: Id,
         right_facts: &Facts,
     ) -> ForkComparison {
-        fn path(id: Id, facts: &Facts) -> Option<(Vec<Id>, Option<Anchor>)> {
-            let mut ids = Vec::new();
-            let mut root = None;
-            let mut cursor = Some(id);
-            let mut seen = BTreeSet::new();
-            while let Some(current) = cursor {
-                if !seen.insert(current) {
-                    return None;
-                }
-                let Some(work) = facts.work(current) else {
-                    break;
-                };
-                let job = work.job();
-                ids.push(current);
-                cursor = match &job.parent {
-                    Parent::Root(anchor) => {
-                        root = Some(anchor.clone());
-                        None
-                    }
-                    Parent::Receipt(parent) => Some(*parent),
-                };
-            }
-            Some((ids, root))
+        let (Some(a), Some(b)) = (left_facts.branch(), right_facts.branch()) else {
+            return ForkComparison::Deferred;
+        };
+        if a.frames.front().map(|f| f.id()) != Some(left)
+            || b.frames.front().map(|f| f.id()) != Some(right)
+        {
+            return ForkComparison::Deferred;
         }
-        let Some((left_path, left_root)) = path(left, left_facts) else {
+        let Ok(view) = self.view() else {
             return ForkComparison::Deferred;
         };
-        let Some((right_path, right_root)) = path(right, right_facts) else {
-            return ForkComparison::Deferred;
-        };
-        let right_positions: BTreeMap<Id, usize> = right_path
+        let window = self.profile.work_window_limit();
+        let low = self.profile.work_low(view.head.height);
+        let positions: BTreeMap<_, _> = b
+            .frames
             .iter()
             .enumerate()
-            .map(|(index, id)| (*id, index))
+            .map(|(i, f)| (f.id(), i))
             .collect();
-        let common = left_path.iter().enumerate().find_map(|(index, id)| {
-            right_positions
-                .get(id)
-                .map(|right_index| (index, *right_index))
-        });
-        let credited = |ids: &[Id], facts: &Facts| -> Option<u128> {
-            ids.iter().try_fold(0u128, |sum, id| {
-                let work = facts.work(*id)?;
-                let with_uncles = work.job().uncles.0.iter().try_fold(
-                    u128::from(work.job().difficulty),
-                    |total, uncle| {
-                        total.checked_add(u128::from(facts.work(*uncle)?.job().difficulty))
-                    },
-                )?;
-                sum.checked_add(with_uncles)
-            })
+        let common = a
+            .frames
+            .iter()
+            .enumerate()
+            .find_map(|(i, f)| positions.get(&f.id()).map(|j| (i, *j)));
+        let suffix = |branch: &crate::consensus::Ledger, n: usize| -> Option<Vec<u128>> {
+            branch
+                .frames
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(index, frame)| {
+                    frame
+                        .credited(index, window, low)
+                        .try_fold(0u128, |sum, c| sum.checked_add(u128::from(c.difficulty)))
+                })
+                .collect()
         };
-        let (common_left, common_right) = match common {
-            Some(indices) => indices,
-            None if left_root.is_some() && left_root == right_root => {
-                (left_path.len(), right_path.len())
-            }
-            None => {
-                let (Some(left_root), Some(right_root)) = (left_root, right_root) else {
-                    return ForkComparison::Deferred;
-                };
-                let Ok(view) = self.view() else {
-                    return ForkComparison::Deferred;
-                };
-                let left_valid = view.anchor(&left_root).is_ok();
-                let right_valid = view.anchor(&right_root).is_ok();
-                match (left_valid, right_valid) {
-                    (true, false) => return ForkComparison::PreferLeft,
-                    (false, true) => return ForkComparison::PreferRight,
-                    (false, false) => return ForkComparison::Deferred,
-                    (true, true) => {
-                        let Some(left_work) = credited(&left_path, left_facts) else {
-                            return ForkComparison::Deferred;
-                        };
-                        let Some(right_work) = credited(&right_path, right_facts) else {
-                            return ForkComparison::Deferred;
-                        };
-                        return match left_work.cmp(&right_work) {
-                            std::cmp::Ordering::Greater => ForkComparison::PreferLeft,
-                            std::cmp::Ordering::Less => ForkComparison::PreferRight,
-                            std::cmp::Ordering::Equal if left_root.height != right_root.height => {
-                                if left_root.height > right_root.height {
-                                    ForkComparison::PreferLeft
-                                } else {
-                                    ForkComparison::PreferRight
-                                }
-                            }
-                            std::cmp::Ordering::Equal => ForkComparison::Deferred,
-                        };
-                    }
-                }
-            }
-        };
-        let Some(left_work) = credited(&left_path[..common_left], left_facts) else {
-            return ForkComparison::Deferred;
-        };
-        let Some(right_work) = credited(&right_path[..common_right], right_facts) else {
-            return ForkComparison::Deferred;
-        };
-        compare_suffix_work(&[left_work], &[right_work], left, right)
-    }
-    pub(crate) fn publish_evaluation_share(
-        &mut self,
-        result: &Evaluation,
-        facts: &Facts,
-    ) -> Result<()> {
-        let suffix = facts.compact_chain(
-            result.tip,
-            self.profile
-                .validation_limit()
-                .saturating_add(usize::from(self.profile.manifest.uncle_depth)),
-            |id| self.sharechain.indexed(id),
-        )?;
-        let parent_tip = facts
-            .work(result.tip)
-            .and_then(|work| match work.job().parent {
-                Parent::Receipt(parent) => Some(parent),
-                Parent::Root(_) => None,
-            });
-        let parent_closure = self
-            .dependency_closure
-            .as_ref()
-            .filter(|closure| parent_tip == Some(closure.tip()));
-        let closure = facts.verified_closure(result, parent_closure)?;
-        let retained = facts
-            .bytes()
-            .saturating_add(closure.retained_bytes())
-            .saturating_add(closure.encoded_delta_bytes());
-        if retained > self.limits.bytes {
-            return Err(Error::Capacity("evaluation dependency closure"));
-        }
-        let suffix_len = suffix.len();
-        let mut shares = Vec::with_capacity(suffix_len);
-        let snapshot = self
-            .sharechain
-            .db()
-            .read()
-            .map_err(|_| Error::Invalid("sharechain snapshot"))?;
-        let mut state_bytes = Vec::with_capacity(suffix_len);
-        let mut state_roots = Vec::with_capacity(suffix_len);
-        let mut credited_work = Vec::with_capacity(suffix_len);
-        let mut previous_id = None;
-        let mut previous_state_root = [0; 32];
-        for (work, _) in &suffix {
-            let mut credited = u128::from(work.job().difficulty);
-            for uncle_id in &work.job().uncles.0 {
-                let uncle = facts.uncle_work(*uncle_id)?;
-                credited = credited
-                    .checked_add(u128::from(uncle.job().difficulty))
-                    .ok_or(Error::Invalid("sharechain uncle work overflow"))?;
-            }
-            let parent = match work.job().parent {
-                Parent::Root(_) => None,
-                Parent::Receipt(id) => Some(id),
+        if let Some((i, j)) = common {
+            let (Some(a), Some(b)) = (suffix(a, i), suffix(b, j)) else {
+                return ForkComparison::Deferred;
             };
-            let parent_state_root = if parent == previous_id {
-                previous_state_root
-            } else if let Some(parent) = parent {
-                snapshot
-                    .header(&parent)
-                    .map_err(|_| Error::Invalid("sharechain parent"))?
-                    .ok_or(Error::Missing(parent))?
-                    .state_root
+            return if view.check().is_ok() {
+                compare_suffix_work(&a, &b, left, right)
             } else {
-                [0; 32]
+                ForkComparison::Deferred
             };
-            let mut transition = Vec::with_capacity(192 + work.job().uncles.0.len() * 40);
-            transition.extend(b"g2pool.branch-transition\0");
-            transition.extend(1u16.to_be_bytes());
-            transition.extend(parent_state_root);
-            transition.extend(work.id());
-            transition.push(u8::from(parent.is_some()));
-            transition.extend(parent.unwrap_or([0; 32]));
-            transition.extend(work.job().anchor.height.to_be_bytes());
-            transition.extend(work.job().anchor.hash);
-            transition.extend(credited.to_be_bytes());
-            transition.push(work.job().uncles.0.len() as u8);
-            for uncle_id in &work.job().uncles.0 {
-                let uncle = facts.uncle_work(*uncle_id)?;
-                transition.extend(*uncle_id);
-                transition.extend(uncle.job().difficulty.to_be_bytes());
+        }
+        let (Ok(a_work), Ok(b_work)) = (a.window_score(window, low), b.window_score(window, low))
+        else {
+            return ForkComparison::Deferred;
+        };
+        if a_work <= b_work {
+            return ForkComparison::PreferRight;
+        }
+        match self.fresh_alternative(a, left_facts, b, right_facts) {
+            Ok(true) => ForkComparison::PreferLeft,
+            Ok(false) => ForkComparison::PreferRight,
+            Err(_) => ForkComparison::Deferred,
+        }
+    }
+    fn fresh_alternative(
+        &self,
+        candidate: &crate::consensus::Ledger,
+        candidate_facts: &Facts,
+        incumbent: &crate::consensus::Ledger,
+        incumbent_facts: &Facts,
+    ) -> Result<bool> {
+        let view = self.view()?;
+        let window = self.profile.work_window_limit();
+        let low = self.profile.work_low(view.head.height);
+        let mut anchors = BTreeSet::new();
+        let mut timestamps = Vec::new();
+        let mut oldest = u64::MAX;
+        let mut newest = 0;
+        for contribution in candidate.recent(window, low) {
+            let work = candidate_facts.work(contribution.id).ok_or(Error::View)?;
+            let header = view.anchor(&work.job().anchor)?;
+            if work.job().timestamp.abs_diff(header.timestamp.timestamp())
+                > crate::native::MAX_ANCHOR_TIMESTAMP_DEVIATION
+            {
+                return Ok(false);
             }
-            let state_root = crate::codec::hash("SHARE_STATE", &transition);
-            credited_work.push(credited);
-            state_bytes.push(transition);
-            state_roots.push(state_root);
-            previous_id = Some(work.id());
-            previous_state_root = state_root;
+            anchors.insert(work.job().anchor.hash);
+            oldest = oldest.min(header.height);
+            newest = newest.max(header.height);
+            timestamps.push(contribution.timestamp);
         }
-        for (index, (work, body)) in suffix.iter().enumerate() {
-            let parent = match work.job().parent {
-                Parent::Root(_) => None,
-                Parent::Receipt(id) => Some(id),
-            };
-            let share = crate::consensus::coordinator::VerifiedShare {
-                id: work.id(),
-                parent,
-                height: 0,
-                anchor: work.job().anchor.hash,
-                work: credited_work[index],
-                state: &state_bytes[index],
-                body,
-                delta: &[],
-                state_root: state_roots[index],
-            };
-            shares.push(share);
-        }
-        drop(snapshot);
-        if !shares.is_empty() {
-            self.sharechain
-                .store_verified_batch_with_evaluation(&shares, result, &closure)?;
-        } else if self
-            .dependency_closure
-            .as_ref()
-            .is_none_or(|previous| previous.id() != closure.id())
+        let incumbent_anchors: BTreeSet<_> = incumbent
+            .recent(window, low)
+            .map(|c| {
+                incumbent_facts
+                    .work(c.id)
+                    .map(|w| w.job().anchor.hash)
+                    .ok_or(Error::View)
+            })
+            .collect::<Result<_>>()?;
+        if view.head.height.saturating_sub(newest) > self.profile.alternative_age()
+            || view.head.height.saturating_sub(oldest) > self.profile.anchor_window()
+            || anchors.len() * 2 < incumbent_anchors.len()
         {
-            self.sharechain.store_evaluation_closure(result, &closure)?;
+            return Ok(false);
         }
-        self.dependency_closure = Some(closure);
-        Ok(())
+        let primary_count = candidate
+            .recent(window, low)
+            .filter(|c| c.class == 0)
+            .count() as u64;
+        if (candidate.boundary.is_none() && incumbent.boundary.is_none())
+            || primary_count * u64::from(self.profile.manifest.share_target_seconds)
+                < grin_core::consensus::BLOCK_TIME_SEC
+        {
+            view.check()?;
+            return Ok(true);
+        }
+        timestamps.sort_unstable();
+        let cut = timestamps.len().div_ceil(10);
+        if cut == 0 || cut > timestamps.len() - cut {
+            return Ok(false);
+        }
+        let span = u128::from(timestamps[timestamps.len() - cut] - timestamps[cut - 1]);
+        let native_span =
+            u128::from(newest - oldest + 1) * u128::from(grin_core::consensus::BLOCK_TIME_SEC) * 8
+                / 10;
+        view.check()?;
+        Ok(span * 3 >= native_span * 2 && span * 3 <= native_span * 4)
     }
     pub(crate) fn verified_facts(&self, anchor: &Anchor) -> Option<&Facts> {
         self.warm
@@ -517,18 +378,6 @@ impl Node {
             .filter(|(verified, _)| verified == anchor)
             .map(|(_, facts)| facts)
     }
-    fn evaluate_cached(&self, tip: Id) -> Result<(Evaluation, Facts)> {
-        let view = self.view()?;
-        let mut validator =
-            Validator::bounded(&self.store, &view, self.limits.clone(), self.cancel.clone());
-        if let Some((anchor, facts)) = &self.warm {
-            if *anchor == view.head {
-                validator.seed(facts);
-            }
-        }
-        validator.evaluate_with_facts(tip)
-    }
-
     pub fn ensure_view(&mut self) -> Result<()> {
         let head = self.view()?.head;
         if self.revision()?.anchor != head {
@@ -551,20 +400,30 @@ impl Node {
         Ok(())
     }
     fn begin_refresh(&mut self) -> Result<()> {
+        self.release_abandoned()?;
+        let incumbent = self
+            .best
+            .or(self.store.revision()?.and_then(|revision| revision.tip))
+            .or_else(|| self.recovery.front().map(|(origin, _)| *origin));
         let head = self.view()?.head;
-        self.tasks.clear();
+        let view = View::pin(
+            &self.chain,
+            self.profile.clone(),
+            chrono::Utc::now().timestamp(),
+        )?;
+        for task in self.tasks.values_mut() {
+            task.session.rebase(&view)?;
+        }
+        view.check()?;
         self.rebase_facts(&head)?;
         self.best = None;
         self.validated.clear();
         self.recovery_seen.clear();
         self.store.fence(&head)?;
         self.store.clear_selection()?;
-        self.recovery = self
-            .store
-            .heads()?
-            .into_iter()
-            .map(|head| (head.tip, head.tip))
-            .collect();
+        let mut heads = self.store.heads()?;
+        heads.sort_by_key(|head| Some(head.tip) != incumbent);
+        self.recovery = heads.into_iter().map(|head| (head.tip, head.tip)).collect();
         if self.recovery.len() > self.limits.work {
             return Err(Error::Capacity("recovery roots"));
         }

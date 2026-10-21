@@ -56,26 +56,3 @@ async fn only_malformed_remote_data_is_marked_for_banning() {
         .unwrap_err();
     assert!(!is_remote_protocol_error(&error));
 }
-
-async fn read_typed(length: usize, tag: u8) -> io::Result<Vec<u8>> {
-    let mut wire = (length as u32).to_be_bytes().to_vec();
-    wire.push(tag);
-    wire.resize(4 + length, 0);
-    frame(
-        &mut libp2p::futures::io::Cursor::new(wire),
-        FRAME,
-        |candidate| candidate == tag,
-    )
-    .await
-}
-
-#[tokio::test]
-async fn typed_compact_frames_accept_full_boundaries_and_reject_one_more_byte() {
-    for (tag, limit) in [
-        (11, super::super::chain_sync::LOCATOR_FRAME),
-        (12, super::super::chain_sync::HEADERS_FRAME),
-    ] {
-        assert_eq!(read_typed(limit, tag).await.unwrap().len(), limit);
-        assert!(read_typed(limit + 1, tag).await.is_err());
-    }
-}

@@ -68,7 +68,7 @@ impl Monitor {
             peers: node.connected.clone(),
             sync,
             path,
-            database: node.store.archive(),
+            database: node.store.database(),
         }
     }
     pub fn run(self, stop: Arc<AtomicBool>) {

@@ -4,9 +4,9 @@ use crate::consensus::Session;
 pub(super) struct Acquisition {
     pub(super) session: Session,
     pub(super) leased: BTreeSet<Key>,
-    started: std::time::Instant,
-    seeded: bool,
+    deadline: u64,
     checked_at: i64,
+    checked_tip: bool,
     recovery_origin: Option<Id>,
 }
 pub(super) struct Running {
@@ -75,6 +75,17 @@ impl Recovery {
 }
 impl Node {
     pub(super) fn release_abandoned(&mut self) -> Result<()> {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let expired: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.tasks.remove(&id);
+            self.store.release_acquisition(id)?;
+        }
         let abandoned: Vec<_> = self
             .running
             .iter()
@@ -90,45 +101,58 @@ impl Node {
         }
         Ok(())
     }
-    fn prepare_acquisition(&mut self, tip: Id) -> Result<Revision> {
-        self.ensure_view()?;
-        let expected = self.revision()?;
-        let now = std::time::Instant::now();
-        let expired: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|(_, task)| {
-                now.duration_since(task.started) >= std::time::Duration::from_secs(900)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            self.tasks.remove(&id);
-            self.store.release_acquisition(id)?;
+    fn acquisition_bytes(&self) -> usize {
+        self.tasks.values().fold(
+            self.warm
+                .as_ref()
+                .map_or(0, |(_, facts)| facts.bytes())
+                .saturating_add(self.running.values().map(|task| task.bytes).sum::<usize>()),
+            |sum, task| sum.saturating_add(task.session.bytes() + task.leased.len() * 128),
+        )
+    }
+    fn retain_acquisition(&mut self, tip: Id, task: Acquisition) -> Result<()> {
+        if self
+            .acquisition_bytes()
+            .saturating_add(task.session.bytes() + task.leased.len() * 128)
+            > self.limits.bytes
+        {
+            self.store.release_acquisition(tip)?;
+            return Err(Error::Capacity("acquisition memory"));
         }
+        self.tasks.insert(tip, task);
+        Ok(())
+    }
+    fn prepare_acquisition(&mut self, tip: Id) -> Result<Revision> {
+        let expected = self.revision()?;
         if !self.tasks.contains_key(&tip) {
             if self.tasks.len() + self.running.len() >= 8 {
                 let victim = self
                     .tasks
                     .iter()
                     .filter(|(_, task)| task.session.cost().work == 0)
-                    .min_by_key(|(_, task)| task.started)
+                    .min_by_key(|(_, task)| task.deadline)
                     .map(|(id, _)| *id)
                     .ok_or(Error::Capacity("acquisition tasks"))?;
                 self.tasks.remove(&victim);
                 self.store.release_acquisition(victim)?;
             }
-            self.store
-                .acquire(tip, &expected.anchor, &BTreeSet::new(), self.limits.facts)?;
-            let session = Session::new(tip, expected.anchor.clone(), self.profile.protocol);
+            let deadline = self
+                .store
+                .acquire(tip, &BTreeSet::new(), self.limits.facts)?;
+            let mut session = Session::new(tip, expected.anchor.clone(), self.profile.protocol);
+            if let Some((anchor, facts)) = &self.warm {
+                if *anchor == expected.anchor {
+                    session.seed(facts);
+                }
+            }
             self.tasks.insert(
                 tip,
                 Acquisition {
                     session,
                     leased: BTreeSet::new(),
-                    started: now,
-                    seeded: false,
+                    deadline,
                     checked_at: i64::MIN,
+                    checked_tip: false,
                     recovery_origin: None,
                 },
             );
@@ -138,6 +162,16 @@ impl Node {
 
     pub(crate) fn take_turn(&mut self, tip: Id) -> Result<Option<Turn>> {
         self.release_abandoned()?;
+        self.ensure_view()?;
+        if self.best.is_none()
+            && (self.recovery.front().is_some_and(|(_, next)| *next != tip)
+                || self
+                    .running
+                    .values()
+                    .any(|task| task.recovery_origin.is_some()))
+        {
+            return Ok(None);
+        }
         if self.running.contains_key(&tip) {
             return Ok(None);
         }
@@ -184,63 +218,60 @@ impl Node {
         mut task: Acquisition,
         outcome: Result<EvaluationProgress>,
     ) -> Result<EvaluationProgress> {
-        if task.started.elapsed() >= std::time::Duration::from_secs(900) {
+        if task.deadline <= chrono::Utc::now().timestamp().max(0) as u64 {
             self.store.release_acquisition(tip)?;
             return Err(Error::Capacity("acquisition lifetime"));
         }
-        let view = self.view()?;
-        if view.head != previous.anchor || view.now < task.checked_at {
-            self.store.release_acquisition(tip)?;
-            return Err(Error::View);
-        }
-        let expected = self.revision()?;
-        if expected.anchor != previous.anchor {
-            self.store.release_acquisition(tip)?;
-            return Err(Error::View);
-        }
-        if let Err(error) = outcome {
-            self.store.release_acquisition(tip)?;
-            return Err(error);
-        }
-        let progress = outcome.unwrap();
-        if !task.seeded && task.session.cost().work > 0 {
-            if let Some((anchor, facts)) = &self.warm {
-                if *anchor == expected.anchor {
-                    task.session.seed(facts);
-                }
-            }
-            task.seeded = true;
-        }
         let mut pins = task.session.acquired();
-        if let EvaluationProgress::Missing(key) = &progress {
+        if let Ok(EvaluationProgress::Missing(key)) = &outcome {
             pins.insert(*key);
             if key.kind == Kind::Core {
                 pins.insert(Key::new(Kind::Authorization, key.id));
             }
         }
         let fresh: BTreeSet<_> = pins.difference(&task.leased).copied().collect();
-        task.leased.extend(pins);
         if !fresh.is_empty() {
-            if let Err(error) = self
-                .store
-                .acquire(tip, &expected.anchor, &fresh, self.limits.facts)
-            {
+            if let Err(error) = self.store.acquire(tip, &fresh, self.limits.facts) {
                 self.store.release_acquisition(tip)?;
                 return Err(error);
             }
         }
-        let memory = self.tasks.values().fold(
-            self.warm
-                .as_ref()
-                .map_or(0, |(_, facts)| facts.bytes())
-                .saturating_add(
-                    self.dependency_closure
-                        .as_ref()
-                        .map_or(0, |closure| closure.retained_bytes()),
-                )
-                .saturating_add(self.running.values().map(|task| task.bytes).sum::<usize>()),
-            |sum, task| sum.saturating_add(task.session.bytes() + task.leased.len() * 128),
-        );
+        task.leased.extend(pins);
+        let view = self.view()?;
+        if view.head != previous.anchor || view.now < task.checked_at {
+            task.session.rebase(&view)?;
+            self.retain_acquisition(tip, task)?;
+            self.ensure_view()?;
+            return Ok(EvaluationProgress::Pending);
+        }
+        let expected = self.revision()?;
+        if expected.anchor != previous.anchor {
+            self.retain_acquisition(tip, task)?;
+            return Ok(EvaluationProgress::Pending);
+        }
+        if let Err(error) = outcome {
+            self.store.release_acquisition(tip)?;
+            return Err(error);
+        }
+        let progress = outcome.unwrap();
+        if !task.checked_tip {
+            let facts = task.session.facts();
+            if let Some(work) = facts.work(tip) {
+                if self.best.is_none()
+                    && task.recovery_origin.is_none()
+                    && expected
+                        .anchor
+                        .height
+                        .saturating_sub(work.job().anchor.height)
+                        > self.profile.bootstrap_age()
+                {
+                    self.store.release_acquisition(tip)?;
+                    return Err(Error::Expired);
+                }
+                task.checked_tip = true;
+            }
+        }
+        let memory = self.acquisition_bytes();
         if memory.saturating_add(task.session.bytes() + task.leased.len() * 128) > self.limits.bytes
         {
             self.store.release_acquisition(tip)?;
@@ -264,10 +295,6 @@ impl Node {
                 None => true,
                 Some(old) => self.prefer_candidate(result.tip, &facts, old)?,
             };
-            if let Err(error) = self.publish_evaluation_share(result, &facts) {
-                self.store.release_acquisition(tip)?;
-                return Err(error);
-            }
             if let Err(error) = self.store.promote_replacing(
                 &expected,
                 result,
@@ -285,7 +312,7 @@ impl Node {
             }
             self.store.release_acquisition(tip)?;
         } else {
-            self.tasks.insert(tip, task);
+            self.retain_acquisition(tip, task)?;
         }
         self.publish_snapshot()?;
         Ok(progress)
@@ -293,19 +320,13 @@ impl Node {
     pub fn prepare_recovery(&mut self) -> Result<Option<Recovery>> {
         self.release_abandoned()?;
         self.ensure_view()?;
-        let Some((origin, tip)) = self.recovery.pop_front() else {
+        let Some(&(origin, tip)) = self.recovery.front() else {
             return Ok(None);
         };
         let mut turn = match self.take_turn(tip) {
             Ok(Some(turn)) => turn,
-            Ok(None) | Err(Error::Capacity(_)) => {
-                queue_recovery(self, (origin, tip))?;
-                return Ok(None);
-            }
-            Err(error) => {
-                self.recovery.push_back((origin, tip));
-                return Err(error);
-            }
+            Ok(None) | Err(Error::Capacity(_)) => return Ok(None),
+            Err(error) => return Err(error),
         };
         if let Some(task) = self.running.get_mut(&tip) {
             task.recovery_origin = Some(origin);
@@ -320,11 +341,22 @@ impl Node {
         } = result;
         let anchor = turn.expected.anchor.clone();
         match self.finish_turn(turn, outcome) {
+            Ok(EvaluationProgress::Missing(_)) if tip != origin => {
+                self.tasks.remove(&tip);
+                self.store.release_acquisition(tip)?;
+                self.store.retire(origin)?;
+                self.recovery.retain(|item| *item != (origin, tip));
+            }
             Ok(EvaluationProgress::Pending | EvaluationProgress::Missing(_)) => {
                 queue_recovery(self, (origin, tip))?;
             }
-            Ok(EvaluationProgress::Ready(_)) => {}
-            Err(Error::Expired) => self.store.retire(origin)?,
+            Ok(EvaluationProgress::Ready(_)) => {
+                self.recovery.retain(|item| *item != (origin, tip));
+            }
+            Err(Error::Expired) => {
+                self.store.retire(origin)?;
+                self.recovery.retain(|item| *item != (origin, tip));
+            }
             Err(Error::View) => {
                 if self.view()?.head != anchor {
                     return Err(Error::View);
@@ -339,6 +371,7 @@ impl Node {
                 } else {
                     self.store.retire(origin)?;
                 }
+                self.recovery.retain(|item| *item != (origin, tip));
             }
             Err(error) => {
                 queue_recovery(self, (origin, tip))?;
@@ -348,16 +381,11 @@ impl Node {
         self.publish_snapshot()
     }
     pub fn acquisition_heads(&self) -> Result<Vec<Id>> {
-        self.store.acquisitions(&self.revision()?.anchor)
+        self.store.acquisitions()
     }
     pub fn protect_download(&mut self, tip: Id, keys: &[Key]) -> Result<()> {
-        let anchor = self.revision()?.anchor;
-        self.store.acquire(
-            tip,
-            &anchor,
-            &keys.iter().copied().collect(),
-            self.limits.facts,
-        )?;
+        self.store
+            .acquire(tip, &keys.iter().copied().collect(), self.limits.facts)?;
         if let Some(task) = self.tasks.get_mut(&tip) {
             task.leased.extend(keys.iter().copied());
         }

@@ -279,7 +279,7 @@ fn valid_ancestor_and_empty_state_qualify_but_unknown_history_does_not() {
     client.synchronize(&left, &servers.stop).unwrap();
     client.observed_heads = observed;
     assert_ne!(ancestor, descendant);
-    assert!(lock(&left).unwrap().sharechain.indexed(ancestor).unwrap());
+    assert!(lock(&left).unwrap().knows_head(ancestor));
     assert_eq!(
         lock(&left).unwrap().advertised_heads().unwrap(),
         vec![descendant]
@@ -296,6 +296,20 @@ fn valid_ancestor_and_empty_state_qualify_but_unknown_history_does_not() {
 fn inbound_and_outbound_sessions_exchange_shares_over_one_connection() {
     let (mut left, left_signer, left_wallet, _left_dir) = crate::node::tests::setup();
     let (mut right, right_signer, right_wallet, _right_dir) = crate::node::tests::setup();
+    crate::node::tests::prepare_template(
+        &mut left,
+        &left_signer,
+        &left_wallet,
+        grin_core::core::Transaction::empty(),
+    )
+    .unwrap();
+    crate::node::tests::prepare_template(
+        &mut right,
+        &right_signer,
+        &right_wallet,
+        grin_core::core::Transaction::empty(),
+    )
+    .unwrap();
     left.peers = super::super::peers::Book::memory(true);
     right.peers = super::super::peers::Book::memory(true);
     let left = Arc::new(Mutex::new(left));
@@ -321,14 +335,14 @@ fn inbound_and_outbound_sessions_exchange_shares_over_one_connection() {
     wait_until(|| {
         outgoing.tick(Instant::now()).unwrap();
         incoming.tick(Instant::now()).unwrap();
-        lock(&right).unwrap().sharechain.indexed(tip).unwrap()
+        lock(&right).unwrap().knows_head(tip)
     });
     let child =
         crate::node::tests::share(&mut lock(&right).unwrap(), &right_signer, &right_wallet).0;
     wait_until(|| {
         outgoing.tick(Instant::now()).unwrap();
         incoming.tick(Instant::now()).unwrap();
-        lock(&left).unwrap().sharechain.indexed(child).unwrap()
+        lock(&left).unwrap().knows_head(child)
     });
     assert!(incoming.peers.is_empty());
     assert_eq!(incoming.transport.connected.load(Ordering::Acquire), 1);

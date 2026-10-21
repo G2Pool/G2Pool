@@ -1,19 +1,41 @@
 use super::*;
-use crate::storage::sharechain::{runtime_store::*, Header, Record, SharechainDb};
+use crate::storage::sharechain::{runtime_store::*, SharechainDb};
 
 #[test]
-fn one_budget_bounds_archive_runtime_and_auxiliary_writes_but_preserves_solution_space() {
+fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, 1024 * 1024, [7; 32]).unwrap();
+    let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, [7; 32]).unwrap();
     let limits = RuntimeLimits {
         max_objects: 100,
         max_bytes: 1024 * 1024,
         max_object_bytes: 1024 * 1024,
         max_lease_keys: 100,
         max_head_keys: 100,
-        max_heads: 10,
+        max_heads: 1,
     };
-    db.runtime_store(limits).unwrap();
+    let selected = RuntimeRevision {
+        generation: 1,
+        tip: Some([10; 32]),
+        ..Default::default()
+    };
+    db.runtime_store(limits)
+        .unwrap()
+        .apply(
+            0,
+            RuntimeBatch {
+                heads: &[RuntimeHead {
+                    id: [10; 32],
+                    binding: [10; 32],
+                    parent: None,
+                    added: &[],
+                    removed: &[],
+                    metadata: &[],
+                }],
+                selection: Some((RuntimeRevision::default(), selected)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let initial = db.used_bytes().unwrap();
     assert_eq!(initial, db.env.non_free_pages_size().unwrap());
     db.set_byte_limit(initial + 8192);
@@ -24,26 +46,6 @@ fn one_budget_bounds_archive_runtime_and_auxiliary_writes_but_preserves_solution
         Err(Error::Quota(_))
     ));
     assert!(db.auxiliary_read(b"test").unwrap().is_none());
-    let record = Record {
-        id: [1; 32],
-        header: Header {
-            parent: None,
-            height: 0,
-            work: 1,
-            cumulative_work: 1,
-            anchor: [9; 32],
-            parent_state_root: [0; 32],
-            state_root: [0; 32],
-        },
-        body: &bytes,
-        delta: &[],
-        state: &[],
-    };
-    assert!(matches!(
-        db.publish_validated(0, &[record], [1; 32]),
-        Err(Error::Quota(_))
-    ));
-    assert!(db.read().unwrap().header(&[1; 32]).unwrap().is_none());
     assert!(matches!(
         runtime.apply(
             0,
@@ -61,12 +63,37 @@ fn one_budget_bounds_archive_runtime_and_auxiliary_writes_but_preserves_solution
                         .unwrap(),
                     bytes: &bytes
                 }],
+                heads: &[RuntimeHead {
+                    id: [11; 32],
+                    binding: [11; 32],
+                    parent: Some([10; 32]),
+                    added: &[RoutingKey {
+                        kind: 1,
+                        id: [1; 32]
+                    }],
+                    removed: &[],
+                    metadata: &[],
+                }],
+                release_heads: &[[10; 32]],
+                selection: Some((
+                    selected,
+                    RuntimeRevision {
+                        generation: 2,
+                        tip: Some([11; 32]),
+                        ..selected
+                    }
+                )),
                 ..Default::default()
             }
         ),
         Err(Error::Quota(_))
     ));
     assert_eq!(runtime.snapshot().unwrap().usage().unwrap(), (0, 0));
+    assert_eq!(runtime.snapshot().unwrap().revision().unwrap(), selected);
+    assert_eq!(
+        runtime.snapshot().unwrap().heads(2).unwrap(),
+        vec![([10; 32], vec![])]
+    );
     db.solution_transaction::<_, Error>(|tx, table| {
         table.put(tx, b"aux/native/submission/test", &bytes)?;
         Ok(())
@@ -84,7 +111,7 @@ fn one_budget_bounds_archive_runtime_and_auxiliary_writes_but_preserves_solution
 #[test]
 fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = SharechainDb::open(dir.path(), 5 * 1024 * 1024, 64 * 1024, [7; 32]).unwrap();
+    let mut db = SharechainDb::open(dir.path(), 5 * 1024 * 1024, [7; 32]).unwrap();
     db.set_byte_limit(4 * 1024 * 1024);
     let value = vec![1; 4096];
     let mut keys = Vec::new();
@@ -98,7 +125,7 @@ fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
     }
     assert!(keys.len() > 256 && keys.len() < 2000);
     let previous = db.used_bytes().unwrap();
-    let old = db.read().unwrap();
+    let old = db.env.read_txn().unwrap();
     db.auxiliary_transaction::<_, Error>(|tx, table| {
         for key in keys.iter().take(256) {
             table.delete(tx, key)?;
@@ -107,7 +134,7 @@ fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
     })
     .unwrap();
     assert!(db.used_bytes().unwrap() < previous);
-    assert!(db.runtime.get(&old.tx, &keys[0]).unwrap().is_some());
+    assert!(db.runtime.get(&old, &keys[0]).unwrap().is_some());
     assert!(db.auxiliary_read(&keys[0]).unwrap().is_none());
     let retained_key = &keys[256];
     let mut full = false;
@@ -125,7 +152,7 @@ fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
     }
     assert!(full);
     assert_eq!(
-        db.runtime.get(&old.tx, retained_key).unwrap(),
+        db.runtime.get(&old, retained_key).unwrap(),
         Some(value.as_slice())
     );
     drop(old);
@@ -136,7 +163,7 @@ fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
 #[test]
 fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, 1024 * 1024, [7; 32]).unwrap();
+    let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, [7; 32]).unwrap();
     let limits = RuntimeLimits {
         max_objects: 10,
         max_bytes: 8 * 1024 * 1024,

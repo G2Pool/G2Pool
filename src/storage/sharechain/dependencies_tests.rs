@@ -1,5 +1,55 @@
 use super::*;
-use crate::storage::sharechain::{Header, Record, SharechainDb};
+use crate::storage::sharechain::SharechainDb as Environment;
+use std::path::Path;
+struct Fixture {
+    env: Env<WithoutTls>,
+    dependencies: DependencyDb,
+    max_record_bytes: usize,
+}
+impl Fixture {
+    fn open(path: &Path, map_bytes: usize, max_record_bytes: usize, protocol: Id) -> Result<Self> {
+        let env = Environment::open(path, map_bytes, protocol)?.env;
+        let mut tx = env.write_txn()?;
+        let dependencies = DependencyDb::open_runtime(&env, &mut tx)?;
+        tx.commit()?;
+        Ok(Self {
+            env,
+            dependencies,
+            max_record_bytes,
+        })
+    }
+    fn read(&self) -> Result<Snapshot<'_>> {
+        Ok(Snapshot {
+            db: self,
+            tx: self.env.read_txn()?,
+        })
+    }
+    fn drain_dependency_gc(&self, max_nodes: usize) -> Result<DependencyGcStats> {
+        let mut tx = self.env.write_txn()?;
+        let result = self.dependencies.drain_gc(&mut tx, max_nodes)?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+struct Snapshot<'a> {
+    db: &'a Fixture,
+    tx: RoTxn<'a, WithoutTls>,
+}
+impl Snapshot<'_> {
+    fn dependencies(&self, manifest: &Id) -> Result<Vec<DependencyKey>> {
+        self.db.dependencies.resolve(&self.tx, manifest)
+    }
+    fn dependency_object(&self, key: DependencyKey) -> Result<Option<&[u8]>> {
+        self.db.dependencies.object(&self.tx, key)
+    }
+    fn dependency_root(&self, id: &Id) -> Result<Id> {
+        self.db.dependencies.root(&self.tx, id)
+    }
+    fn dependency_retained(&self, id: &Id) -> Result<bool> {
+        self.db.dependencies.retained(&self.tx, id)
+    }
+}
+
 fn id(n: u64) -> Id {
     let mut id = [0; 32];
     id[..8].copy_from_slice(&n.to_be_bytes());
@@ -8,7 +58,7 @@ fn id(n: u64) -> Id {
 fn key(n: u64) -> DependencyKey {
     DependencyKey { kind: 7, id: id(n) }
 }
-fn apply(db: &SharechainDb, batch: &DependencyBatch<'_>) -> Result<()> {
+fn apply(db: &Fixture, batch: &DependencyBatch<'_>) -> Result<()> {
     let mut tx = db.env.write_txn()?;
     let staged = DependencyBatch {
         objects: batch.objects,
@@ -31,13 +81,13 @@ fn apply(db: &SharechainDb, batch: &DependencyBatch<'_>) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
-fn apply_pending(db: &SharechainDb, batch: &DependencyBatch<'_>) -> Result<()> {
+fn apply_pending(db: &Fixture, batch: &DependencyBatch<'_>) -> Result<()> {
     let mut tx = db.env.write_txn()?;
     db.dependencies.apply(&mut tx, batch, db.max_record_bytes)?;
     tx.commit()?;
     Ok(())
 }
-fn seed_pending(db: &SharechainDb, manifest: u64, keys: &[DependencyKey]) {
+fn seed_pending(db: &Fixture, manifest: u64, keys: &[DependencyKey]) {
     let objects: Vec<_> = keys
         .iter()
         .map(|key| DependencyObject {
@@ -60,7 +110,7 @@ fn seed_pending(db: &SharechainDb, manifest: u64, keys: &[DependencyKey]) {
     )
     .unwrap();
 }
-fn finish_gc(db: &SharechainDb, budget: usize) {
+fn finish_gc(db: &Fixture, budget: usize) {
     loop {
         let stats = db.drain_dependency_gc(budget).unwrap();
         assert!(stats.processed_nodes <= budget);
@@ -73,7 +123,7 @@ fn finish_gc(db: &SharechainDb, budget: usize) {
 #[test]
 fn durable_gc_is_bounded_and_resumes_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
     let keys: Vec<_> = (1..=96).map(key).collect();
     seed_pending(&db, 1000, &keys);
     finish_gc(&db, 7);
@@ -103,7 +153,7 @@ fn durable_gc_is_bounded_and_resumes_after_reopen() {
     assert_eq!(stats.reclaimed_nodes, 3);
     assert!(stats.pending_nodes > 0);
     drop(db);
-    let db = SharechainDb::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
     assert!(db.drain_dependency_gc(0).unwrap().pending_nodes > 0);
     finish_gc(&db, 5);
     assert_refs(&db);
@@ -114,7 +164,7 @@ fn durable_gc_is_bounded_and_resumes_after_reopen() {
 #[test]
 fn pending_root_reattachment_and_repeated_release_do_not_double_drop_edges() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     let keys = [key(1), key(2)];
     seed_pending(&db, 1, &keys);
     finish_gc(&db, 4);
@@ -162,7 +212,7 @@ fn pending_root_reattachment_and_repeated_release_do_not_double_drop_edges() {
 #[test]
 fn queued_shared_forks_keep_live_objects_and_prune_protection() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     seed_pending(&db, 1, &[key(1), key(2)]);
     finish_gc(&db, 4);
     apply_pending(
@@ -217,7 +267,7 @@ fn queued_shared_forks_keep_live_objects_and_prune_protection() {
 #[test]
 fn corrupt_gc_children_roll_back_whole_drain() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     seed_pending(&db, 1, &[key(1), key(2)]);
     finish_gc(&db, 8);
     let root = db.read().unwrap().dependency_root(&id(1)).unwrap();
@@ -247,7 +297,7 @@ fn corrupt_gc_children_roll_back_whole_drain() {
 #[test]
 fn fork_retention_and_failed_pruning_are_atomic() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     apply(
         &db,
         &DependencyBatch {
@@ -349,7 +399,7 @@ fn fork_retention_and_failed_pruning_are_atomic() {
 #[test]
 fn roots_require_no_replay_and_reclaim_removed_ancestor_objects() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     apply(
         &db,
         &DependencyBatch {
@@ -406,7 +456,7 @@ fn roots_require_no_replay_and_reclaim_removed_ancestor_objects() {
 #[test]
 fn corrupt_shape_prefix_and_edges_fail_before_traversal() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     apply(
         &db,
         &DependencyBatch {
@@ -468,22 +518,7 @@ fn corrupt_shape_prefix_and_edges_fail_before_traversal() {
     }
     assert_refs(&db);
 }
-#[test]
-fn incompatible_checkpoint_schema_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
-    let mut tx = db.env.write_txn().unwrap();
-    db.meta
-        .put(&mut tx, b"schema", b"sharechain-index-3")
-        .unwrap();
-    tx.commit().unwrap();
-    drop(db);
-    assert!(matches!(
-        SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)),
-        Err(Error::Invalid("schema"))
-    ));
-}
-fn assert_refs(db: &SharechainDb) {
+fn assert_refs(db: &Fixture) {
     let tx = db.env.read_txn().unwrap();
     let dep = &db.dependencies;
     let mut expected = std::collections::BTreeMap::<Id, u64>::new();
@@ -524,7 +559,7 @@ fn assert_refs(db: &SharechainDb) {
 #[test]
 fn path_copy_growth_and_structural_counts_are_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
     let keys: Vec<_> = (1..=96).map(key).collect();
     let objects: Vec<_> = keys
         .iter()
@@ -610,13 +645,13 @@ fn path_copy_growth_and_structural_counts_are_bounded() {
         0
     );
     drop(db);
-    let db = SharechainDb::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
     assert_refs(&db);
 }
 #[test]
 fn patricia_roots_are_canonical_and_deletions_collapse_paths() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 26, 4096, id(999)).unwrap();
     let keys: Vec<_> = (0u64..40)
         .map(|n| DependencyKey {
             kind: (n % 3) as u8,
@@ -720,7 +755,7 @@ fn patricia_roots_are_canonical_and_deletions_collapse_paths() {
 #[test]
 fn object_restore_and_manifest_digest_separate_delta_boundaries() {
     let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
+    let db = Fixture::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
     apply(
         &db,
         &DependencyBatch {
@@ -783,115 +818,6 @@ fn object_restore_and_manifest_digest_separate_delta_boundaries() {
     );
     assert_refs(&db);
 }
-#[test]
-fn invalid_delta_cycles_and_missing_objects_leave_publication_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = SharechainDb::open(dir.path(), 1 << 24, 1024, id(999)).unwrap();
-    let record = Record {
-        id: id(1),
-        header: Header {
-            parent: None,
-            height: 0,
-            work: 1,
-            cumulative_work: 1,
-            anchor: id(9),
-            parent_state_root: [0; 32],
-            state_root: [0; 32],
-        },
-        body: b"body",
-        delta: &[],
-        state: &[],
-    };
-    let batch = DependencyBatch {
-        manifests: &[DependencyManifest {
-            id: id(1),
-            parent: None,
-            added: &[key(1)],
-            removed: &[],
-        }],
-        ..Default::default()
-    };
-    assert!(db
-        .publish_validated_with_dependencies(0, &[record], id(1), id(1), &batch)
-        .is_err());
-    let snapshot = db.read().unwrap();
-    assert!(snapshot.publication().unwrap().is_none());
-    assert!(snapshot.header(&id(1)).unwrap().is_none());
-    drop(snapshot);
-    assert!(apply(
-        &db,
-        &DependencyBatch {
-            manifests: &[DependencyManifest {
-                id: id(1),
-                parent: Some(id(1)),
-                added: &[],
-                removed: &[]
-            }],
-            ..Default::default()
-        }
-    )
-    .is_err());
-    assert!(apply(
-        &db,
-        &DependencyBatch {
-            manifests: &[
-                DependencyManifest {
-                    id: id(1),
-                    parent: Some(id(2)),
-                    added: &[],
-                    removed: &[]
-                },
-                DependencyManifest {
-                    id: id(2),
-                    parent: Some(id(1)),
-                    added: &[],
-                    removed: &[]
-                }
-            ],
-            ..Default::default()
-        }
-    )
-    .is_err());
-    apply(
-        &db,
-        &DependencyBatch {
-            objects: &[DependencyObject {
-                key: key(1),
-                bytes: b"one",
-            }],
-            manifests: &[DependencyManifest {
-                id: id(1),
-                parent: None,
-                added: &[key(1)],
-                removed: &[],
-            }],
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for (added, removed) in [
-        (vec![key(1)], vec![]),
-        (vec![], vec![key(2)]),
-        (vec![key(2), key(2)], vec![]),
-        (vec![key(1)], vec![key(1)]),
-    ] {
-        assert!(apply(
-            &db,
-            &DependencyBatch {
-                manifests: &[DependencyManifest {
-                    id: id(2),
-                    parent: Some(id(1)),
-                    added: &added,
-                    removed: &removed
-                }],
-                ..Default::default()
-            }
-        )
-        .is_err());
-        assert!(db.read().unwrap().dependencies(&id(2)).is_err());
-    }
-}
-
 impl DependencyDb {
     pub(crate) fn node_count(&self, tx: &RoTxn<'_, WithoutTls>) -> Result<u64> {
         Ok(self.nodes.len(tx)?)

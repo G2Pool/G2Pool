@@ -160,11 +160,10 @@ pub struct RuntimeHead<'a> {
     pub removed: &'a [RoutingKey],
 }
 pub struct RuntimeLease<'a> {
-    pub metadata: &'a [u8],
     pub id: Id,
     pub keys: &'a [RoutingKey],
 }
-pub type LeaseInfo = (Id, u64, Vec<RoutingKey>, Vec<u8>);
+pub type LeaseInfo = (Id, u64, Vec<RoutingKey>);
 #[derive(Default)]
 pub struct RuntimeBatch<'a> {
     pub objects: &'a [RuntimeObject<'a>],
@@ -287,7 +286,6 @@ impl RuntimeStore {
             }
         }
         for k in expired {
-            self.db.delete(tx, &key(b'q', &k[1..]))?;
             self.db.delete(tx, &k)?;
         }
         Ok(())
@@ -551,7 +549,6 @@ impl RuntimeStore {
         }
         for id in batch.release_leases {
             self.db.delete(tx, &key(b'l', id))?;
-            self.db.delete(tx, &key(b'q', id))?;
         }
         for lease in batch.leases {
             let mut keys: BTreeSet<_> = lease.keys.iter().copied().collect();
@@ -568,7 +565,7 @@ impl RuntimeStore {
                 }
                 num(Some(&old[..8]))?
             } else {
-                now.checked_add(900)
+                now.checked_add(super::ACQUISITION_LIFETIME)
                     .ok_or(Error::Invalid("runtime deadline overflow"))?
             };
             if keys.len() as u64 > lease_limit {
@@ -578,18 +575,6 @@ impl RuntimeStore {
             for k in keys {
                 value.extend(k.bytes());
             }
-            let metadata_key = key(b'q', &lease.id);
-            if lease.metadata.len() > 4096 {
-                return Err(Error::Invalid("runtime lease metadata"));
-            }
-            if self
-                .db
-                .get(tx, &metadata_key)?
-                .is_some_and(|m| m != lease.metadata)
-            {
-                return Err(Error::Invalid("runtime lease metadata changed"));
-            }
-            self.db.put(tx, &metadata_key, lease.metadata)?;
             self.db.put(tx, &lk, &value)?;
         }
         let mut lease_count = 0u64;
@@ -1110,14 +1095,6 @@ impl RuntimeReader<'_> {
                     return Err(Error::Invalid("runtime lease"));
                 }
                 let id: Id = k[1..].try_into().unwrap();
-                let metadata = self
-                    .store
-                    .db
-                    .get(self.txn, &key(b'q', &id))?
-                    .ok_or(Error::Missing)?;
-                if metadata.len() > 4096 {
-                    return Err(Error::Invalid("runtime lease metadata"));
-                }
                 Ok((
                     id,
                     num(Some(&v[..8]))?,
@@ -1127,7 +1104,6 @@ impl RuntimeReader<'_> {
                         .iter()
                         .map(|k| RoutingKey::decode(k))
                         .collect::<Result<Vec<_>>>()?,
-                    metadata.to_vec(),
                 ))
             })
             .collect()

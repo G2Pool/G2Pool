@@ -1,14 +1,22 @@
-use crate::objects::Key;
+use crate::{codec::Id, objects::Key};
 use std::{collections::HashSet, sync::Arc};
 
 #[derive(Default)]
 pub(super) struct Trace {
+    pub(super) target: Option<Id>,
     pub(super) keys: Vec<Key>,
     pub(super) children: Vec<Arc<Trace>>,
 }
 impl Trace {
+    pub(super) fn target(id: Id) -> Arc<Self> {
+        Arc::new(Self {
+            target: Some(id),
+            ..Self::default()
+        })
+    }
     pub(super) fn leaf(key: Key) -> Arc<Self> {
         Arc::new(Self {
+            target: None,
             keys: vec![key],
             children: vec![],
         })
@@ -20,6 +28,7 @@ impl Trace {
             .filter(|child| seen.insert(Arc::as_ptr(child) as usize))
             .collect();
         Arc::new(Self {
+            target: None,
             keys: vec![],
             children,
         })

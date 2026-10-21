@@ -2,6 +2,9 @@ use super::*;
 
 pub const NATIVE_VERSION: &[u8; 10] = b"grin-5.5.2";
 pub const NATIVE_CODEC: u32 = 1000;
+const BOOTSTRAP_MAX_AGE_SECONDS: u64 = 4 * 60;
+const ALTERNATIVE_MAX_AGE_SECONDS: u64 = 20 * 60;
+pub(crate) const MAX_ANCHOR_TIMESTAMP_DEVIATION: u64 = 3 * 60 * 60;
 
 pub fn default_limits() -> Limits {
     Limits {
@@ -17,11 +20,11 @@ pub fn default_limits() -> Limits {
     }
 }
 fn base_manifest(genesis: Id, kind: global::ChainTypes) -> Manifest {
-    let (network, n, m, edge, proof) = match kind {
-        global::ChainTypes::Mainnet => (0, 512, 2160, 32, 42),
-        global::ChainTypes::Testnet => (1, 512, 2160, 32, 42),
-        global::ChainTypes::AutomatedTesting => (2, 8, 3, 10, 8),
-        global::ChainTypes::UserTesting => (3, 8, 3, 15, 42),
+    let (network, unit_budget, share_window, lifetime, edge, proof) = match kind {
+        global::ChainTypes::Mainnet => (0, 512, 2160, 2160, 32, 42),
+        global::ChainTypes::Testnet => (1, 512, 2160, 2160, 32, 42),
+        global::ChainTypes::AutomatedTesting => (2, 8, 3, 3, 10, 8),
+        global::ChainTypes::UserTesting => (3, 8, 3, 3, 15, 42),
     };
     Manifest {
         network,
@@ -29,10 +32,11 @@ fn base_manifest(genesis: Id, kind: global::ChainTypes) -> Manifest {
         grin_version: *NATIVE_VERSION,
         subsidy: 60_000_000_000,
         finder_floor: 1,
-        unit_budget: n,
+        unit_budget,
         share_divisor: 512,
         share_target_seconds: 10,
-        lifetime: m,
+        share_window,
+        lifetime,
         leaves_per_row: crate::codec::COUPON_LEAVES_PER_ROW as u8,
         uncle_depth: 8,
         max_uncles: 8,
@@ -88,12 +92,19 @@ impl Profile {
         })
     }
     pub fn work_window_limit(&self) -> usize {
-        self.manifest.lifetime.min(usize::MAX as u64) as usize
+        self.manifest.share_window as usize
     }
-    pub fn validation_limit(&self) -> usize {
-        self.work_window_limit()
-            .saturating_mul(2)
-            .saturating_add(usize::from(self.manifest.uncle_depth))
+    pub fn bootstrap_age(&self) -> u64 {
+        BOOTSTRAP_MAX_AGE_SECONDS.div_ceil(consensus::BLOCK_TIME_SEC)
+    }
+    pub fn alternative_age(&self) -> u64 {
+        ALTERNATIVE_MAX_AGE_SECONDS.div_ceil(consensus::BLOCK_TIME_SEC)
+    }
+    pub fn window_seconds(&self) -> u64 {
+        u64::from(self.manifest.share_window) * u64::from(self.manifest.share_target_seconds)
+    }
+    pub fn anchor_window(&self) -> u64 {
+        (4 * self.window_seconds()).div_ceil(consensus::BLOCK_TIME_SEC)
     }
     pub fn payout_work_limit(&self, network_difficulty: u64) -> Result<u128> {
         u128::from(network_difficulty)
@@ -109,6 +120,10 @@ impl Profile {
     }
     pub fn finance_low(&self, anchor: u64) -> u64 {
         anchor.saturating_sub(self.manifest.lifetime - 1)
+    }
+    pub fn work_low(&self, anchor: u64) -> u64 {
+        self.finance_low(anchor)
+            .max(anchor.saturating_sub(self.anchor_window()))
     }
     pub fn assigned(&self, network: u64, height: u64) -> Result<u64> {
         if network == 0 {

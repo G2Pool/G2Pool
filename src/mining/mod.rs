@@ -158,6 +158,7 @@ impl Preparation {
             validator.seed(facts);
         }
         let financial = validator.plan(&parent, &view.head, fees)?;
+        let difficulty = validator.share_difficulty(&parent, &view.head)?;
         let mut dependencies = validator.dependencies()?;
         dependencies.insert(Key::new(Kind::Registration, registration_id));
         let inventory = Key::new(Kind::Inventory, own_registration.fields.inventory);
@@ -224,10 +225,6 @@ impl Preparation {
         };
         let native_parent = view.anchor(&view.head)?;
         let target = view.target(&view.head)?;
-        let history = store.share_history(match &parent {
-            Parent::Root(_) => None,
-            Parent::Receipt(id) => Some(*id),
-        })?;
         let timestamp = view.now.max(
             native_parent
                 .timestamp
@@ -242,15 +239,7 @@ impl Preparation {
             parent,
             account: wallet.account(),
             registration: registration_id,
-            difficulty: profile.retargeted(
-                target.difficulty.to_num(),
-                native_parent
-                    .height
-                    .checked_add(1)
-                    .ok_or(Error::Invalid("candidate height overflow"))?,
-                &history,
-                u64::from(profile.manifest.share_target_seconds),
-            )?,
+            difficulty,
             uncles: List(uncles),
             transaction_only: id(&tx)?,
             kernel_encoding_plan: id(&encoding)?,

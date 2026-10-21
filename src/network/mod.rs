@@ -1,7 +1,6 @@
 mod admission;
 mod bans;
 mod budget;
-pub mod chain_sync;
 mod codec;
 pub(crate) mod download;
 pub(crate) mod outbound;
@@ -57,76 +56,6 @@ pub(crate) fn normalize(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, address.port())
 }
 
-fn encode_compact_hint(target: Id, header: chain_sync::Header) -> Vec<u8> {
-    let mut out = Vec::with_capacity(162);
-    out.push(1);
-    out.extend(target);
-    out.extend(header.id);
-    out.push(u8::from(header.parent.is_some()));
-    if let Some(parent) = header.parent {
-        out.extend(parent);
-    }
-    out.extend(header.height.to_be_bytes());
-    out.extend(header.credited_work.to_be_bytes());
-    out.extend(header.cumulative_work.to_be_bytes());
-    out.extend(header.parent_state_root);
-    out.extend(header.state_root);
-    out
-}
-
-fn decode_compact_hint(bytes: &[u8]) -> Result<(Id, chain_sync::Header)> {
-    if bytes.len() < 1 + 32 + 32 + 1 + 8 + 16 + 16 + 32 + 32 {
-        return Err(Error::Invalid("compact cursor encoding"));
-    }
-    let mut offset = 0;
-    fn take<'a>(bytes: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8]> {
-        let end = offset
-            .checked_add(n)
-            .ok_or(Error::Invalid("compact cursor encoding"))?;
-        let value = bytes
-            .get(*offset..end)
-            .ok_or(Error::Invalid("compact cursor encoding"))?;
-        *offset = end;
-        Ok(value)
-    }
-    if take(bytes, &mut offset, 1)?[0] != 1 {
-        return Err(Error::Invalid("compact cursor version"));
-    }
-    let target: Id = take(bytes, &mut offset, 32)?.try_into().unwrap();
-    let id: Id = take(bytes, &mut offset, 32)?.try_into().unwrap();
-    let parent = match take(bytes, &mut offset, 1)?[0] {
-        0 => None,
-        1 => Some(take(bytes, &mut offset, 32)?.try_into().unwrap()),
-        _ => return Err(Error::Invalid("compact cursor parent")),
-    };
-    let u64v = |bytes: &[u8], offset: &mut usize| -> Result<u64> {
-        Ok(u64::from_be_bytes(
-            take(bytes, offset, 8)?.try_into().unwrap(),
-        ))
-    };
-    let u128v = |bytes: &[u8], offset: &mut usize| -> Result<u128> {
-        Ok(u128::from_be_bytes(
-            take(bytes, offset, 16)?.try_into().unwrap(),
-        ))
-    };
-    let header = chain_sync::Header {
-        id,
-        parent,
-        height: u64v(bytes, &mut offset)?,
-        credited_work: u128v(bytes, &mut offset)?,
-        cumulative_work: u128v(bytes, &mut offset)?,
-        parent_state_root: take(bytes, &mut offset, 32)?.try_into().unwrap(),
-        state_root: take(bytes, &mut offset, 32)?.try_into().unwrap(),
-    };
-    if offset != bytes.len()
-        || header.credited_work == 0
-        || header.cumulative_work < header.credited_work
-        || (header.height == 0) != header.parent.is_none()
-    {
-        return Err(Error::Invalid("compact cursor header"));
-    }
-    Ok((target, header))
-}
 pub fn start(
     address: SocketAddr,
     node: Arc<Mutex<Node>>,
@@ -144,8 +73,6 @@ pub struct Client {
     initialized: bool,
     last_heads: Instant,
     next_peers: Instant,
-    compact_cursor: Option<(Id, chain_sync::Header)>,
-    compact_pending: Option<(Id, chain_sync::Header)>,
     generation: Option<libp2p::swarm::ConnectionId>,
     inbound: Option<libp2p::swarm::ConnectionId>,
     observed_heads: Option<(libp2p::swarm::ConnectionId, Vec<Id>)>,
@@ -167,8 +94,6 @@ impl Client {
             observed_heads: None,
             last_heads: Instant::now() - Duration::from_secs(30),
             next_peers: Instant::now(),
-            compact_cursor: None,
-            compact_pending: None,
         }
     }
     pub fn synchronize(&mut self, node: &Arc<Mutex<Node>>, stop: &AtomicBool) -> Result<usize> {
@@ -183,7 +108,6 @@ impl Client {
         if lock(node)?.profile.protocol != self.protocol {
             return Err(Error::Invalid("client protocol"));
         }
-        self.restore_compact_cursor(node)?;
         if self.handle.is_none() {
             self.handle = lock(node)?.transport.clone();
             if self.handle.is_none() {
@@ -210,8 +134,6 @@ impl Client {
                 }
             }
             self.initialized = false;
-            self.compact_cursor = None;
-            self.compact_pending = None;
         }
         result
     }
@@ -253,19 +175,8 @@ impl Client {
             return Ok(None);
         }
         let guard = lock(node)?;
-        let known = guard.advertised_heads()?;
-        let snapshot = guard.sharechain.db().read()?;
-        for tip in tips {
-            let mut verified = false;
-            for head in &known {
-                if chain_sync::common_ancestor(&snapshot, *head, &[*tip])?.is_some() {
-                    verified = true;
-                    break;
-                }
-            }
-            if !verified {
-                return Ok(None);
-            }
+        if !tips.iter().all(|tip| guard.knows_head(*tip)) {
+            return Ok(None);
         }
         Ok(Some(*connection))
     }
@@ -274,56 +185,6 @@ impl Client {
             handle.disconnect(self.address, connection);
         }
     }
-    pub fn compact_headers(
-        &mut self,
-        locator: Vec<Id>,
-        target: Id,
-        start: Id,
-        stop: &AtomicBool,
-    ) -> Result<Vec<chain_sync::Header>> {
-        let packet = self.request(
-            Message::Locator {
-                target,
-                start,
-                locator,
-            },
-            stop,
-        )?;
-        match packet.message() {
-            Message::Headers { headers, .. } => Ok(headers),
-            Message::Busy => Err(Error::Capacity("peer sharechain sync")),
-            _ => Err(Error::Invalid("sharechain header reply")),
-        }
-    }
-
-    pub fn compact_headers_bounded(
-        &mut self,
-        locator: Vec<Id>,
-        target: Id,
-        stop: &AtomicBool,
-    ) -> Result<Vec<chain_sync::Header>> {
-        let (target, previous) = self
-            .compact_cursor
-            .map_or((target, None), |(target, header)| (target, Some(header)));
-        let start = previous.map_or([0; 32], |header| header.id);
-        let request_locator = previous.map_or(locator, |header| vec![header.id]);
-        let page = self.compact_headers(request_locator, target, start, stop)?;
-        if let (Some(previous), Some(first)) = (previous, page.first()) {
-            if first.parent != Some(previous.id)
-                || previous.height.checked_add(1) != Some(first.height)
-                || previous.cumulative_work.checked_add(first.credited_work)
-                    != Some(first.cumulative_work)
-                || previous.state_root != first.parent_state_root
-            {
-                return Err(Error::Invalid("sharechain continuation ancestry"));
-            }
-        }
-        let pending = page.last().copied().map(|header| (target, header));
-        self.compact_cursor = pending.filter(|(_, header)| header.id != target);
-        self.compact_pending = pending;
-        Ok(page)
-    }
-
     fn request(&mut self, message: Message, stop: &AtomicBool) -> Result<codec::Packet> {
         let result = self.handle.as_ref().ok_or(Error::Cancelled)?.request(
             self.address,
@@ -344,93 +205,6 @@ impl Client {
             self.observed_heads = None;
         }
         result
-    }
-
-    fn restore_compact_cursor(&mut self, node: &Arc<Mutex<Node>>) -> Result<()> {
-        if self.inbound.is_some() || self.compact_cursor.is_some() {
-            return Ok(());
-        }
-        let value = lock(node)?
-            .sharechain
-            .db()
-            .read_compact_cursor(self.protocol, &self.address.to_string())
-            .map_err(|_| Error::Invalid("compact cursor read"))?;
-        let Some(value) = value else {
-            return Ok(());
-        };
-        let (target, cursor) = decode_compact_hint(&value)?;
-        let durable = lock(node)?
-            .sharechain
-            .db()
-            .read()
-            .map_err(|_| Error::Invalid("compact cursor snapshot"))?
-            .header(&cursor.id)
-            .map_err(|_| Error::Invalid("compact cursor header"))?
-            .is_some_and(|header| {
-                header.parent == cursor.parent
-                    && header.height == cursor.height
-                    && header.work == cursor.credited_work
-                    && header.cumulative_work == cursor.cumulative_work
-                    && header.parent_state_root == cursor.parent_state_root
-                    && header.state_root == cursor.state_root
-            });
-        if durable {
-            self.compact_cursor = Some((target, cursor));
-        } else {
-            lock(node)?
-                .sharechain
-                .db()
-                .write_compact_cursor(self.protocol, &self.address.to_string(), None)
-                .map_err(|_| Error::Invalid("compact cursor discard"))?;
-        }
-        Ok(())
-    }
-
-    fn persist_compact_cursor(
-        &self,
-        node: &Arc<Mutex<Node>>,
-        target: Id,
-        cursor: Option<chain_sync::Header>,
-    ) -> Result<()> {
-        if self.inbound.is_some() {
-            return Ok(());
-        }
-        let guard = lock(node)?;
-        let db = guard.sharechain.db();
-        let address = self.address.to_string();
-        match cursor {
-            Some(cursor) => db.write_compact_cursor(
-                self.protocol,
-                &address,
-                Some(&encode_compact_hint(target, cursor)),
-            ),
-            None => db.write_compact_cursor(self.protocol, &address, None),
-        }
-        .map_err(|_| Error::Invalid("compact cursor persist"))
-    }
-
-    fn commit_compact_tip(&mut self, node: &Arc<Mutex<Node>>, tip: Id) -> Result<()> {
-        let Some((target, boundary)) = self.compact_pending else {
-            return Ok(());
-        };
-        if boundary.id != tip {
-            return Ok(());
-        }
-        let previous = self.compact_cursor;
-        let next = if boundary.id == target {
-            None
-        } else {
-            Some((target, boundary))
-        };
-        if let Err(error) =
-            self.persist_compact_cursor(node, target, next.map(|(_, header)| header))
-        {
-            self.compact_cursor = previous;
-            return Err(error);
-        }
-        self.compact_pending = None;
-        self.compact_cursor = next;
-        Ok(())
     }
 }
 fn stage(node: &Arc<Mutex<Node>>, objects: Vec<Object>) -> Result<()> {
@@ -533,9 +307,9 @@ fn acquire_turns(
     max_turns: usize,
 ) -> Result<usize> {
     grin_core::global::set_local_chain_type(chain_type(node)?);
-    let (tips, compact) = if session.last_heads.elapsed() >= Duration::from_secs(30) {
+    let tips = if session.last_heads.elapsed() >= Duration::from_secs(30) {
         let heads = session.request(Message::Heads, stop)?;
-        let tips = match heads.message() {
+        match heads.message() {
             Message::Tips(tips) => {
                 session.last_heads = Instant::now();
                 session.observed_heads = session.generation.map(|id| (id, tips.clone()));
@@ -543,34 +317,14 @@ fn acquire_turns(
             }
             Message::Busy => return Ok(0),
             _ => return Err(Error::Invalid("peer heads response")),
-        };
-        let locator = { lock(node)?.sharechain_locator()? };
-        let compact = match (locator, tips.first().copied()) {
-            (Some(locator), Some(target)) => {
-                match session.compact_headers_bounded(locator, target, stop) {
-                    Ok(page) => page,
-                    Err(Error::Capacity(_)) => vec![],
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => vec![],
-        };
-        (tips, compact)
-    } else if let Some((target, header)) = session.compact_cursor {
-        let compact = match session.compact_headers_bounded(vec![header.id], target, stop) {
-            Ok(page) => page,
-            Err(Error::Capacity(_)) => vec![],
-            Err(error) => return Err(error),
-        };
-        (vec![], compact)
+        }
     } else {
-        (vec![], vec![])
+        vec![]
     };
     let mut queue: VecDeque<_> = lock(node)?
         .acquisition_heads()?
         .into_iter()
         .chain(tips)
-        .chain(compact.into_iter().map(|header| header.id))
         .chain(session.handle.as_ref().unwrap().notices(session.address))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -606,7 +360,6 @@ fn acquire_turns(
         let missing = match outcome {
             Ok(EvaluationProgress::Ready(_)) => {
                 admitted += 1;
-                session.commit_compact_tip(node, tip)?;
                 continue;
             }
             Ok(EvaluationProgress::Pending) => {

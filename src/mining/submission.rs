@@ -73,7 +73,7 @@ fn submission_result(
 impl Solutions {
     pub(crate) fn new(store: &Store) -> Self {
         Self {
-            db: store.archive(),
+            db: store.database(),
             runtime: store.runtime(),
         }
     }

@@ -150,22 +150,6 @@ impl<S: Source> Validator<'_, '_, S> {
             Some(work_limit),
             Some(self.view.profile.work_window_limit()),
         )?;
-        let ids: Vec<_> = entries
-            .iter()
-            .map(|(work, class)| (work.id(), work.job().difficulty, *class))
-            .collect();
-        let selected = crate::consensus::window::bounded_ids(
-            &ids,
-            crate::consensus::window::WindowLimits {
-                primary_limit: self.view.profile.work_window_limit(),
-                receipt_limit: crate::codec::MAX_ENCODING_ENTRIES,
-                work_limit: Some(work_limit),
-            },
-        )?;
-        let entries: Vec<_> = entries
-            .into_iter()
-            .filter(|(work, _)| selected.contains(&work.id()))
-            .collect();
         let output_slots = entries
             .iter()
             .map(|(work, _)| work.job.account)

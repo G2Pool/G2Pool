@@ -9,12 +9,12 @@ fn key(prefix: &[u8], name: &str) -> Vec<u8> {
 }
 fn read(store: &Store, key: &[u8]) -> Result<Option<Vec<u8>>> {
     store.check_reader()?;
-    store.archive.auxiliary_read(key).map_err(runtime_error)
+    store.database.auxiliary_read(key).map_err(runtime_error)
 }
 impl Store {
     pub fn wallet_registrations(&self) -> Result<Vec<Vec<u8>>> {
         self.check_reader()?;
-        self.archive
+        self.database
             .auxiliary_read_prefix(b"aux/wallet/record/registration:", 100_000, 512, 256 * 1024)
             .map_err(runtime_error)
             .map(|rows| {
@@ -26,7 +26,7 @@ impl Store {
     }
     pub fn bind_wallet(&mut self, account: Point) -> Result<()> {
         self.check_writer()?;
-        self.archive.auxiliary_transaction(|tx, db| {
+        self.database.auxiliary_transaction(|tx, db| {
             let account_key = key(RECORDS, "account");
             if let Some(previous) = db.get(tx, &account_key)? {
                 if previous != account {
@@ -59,10 +59,10 @@ impl Store {
         objects: &[Object],
         registration: &crate::wallet::RegistrationPlan,
     ) -> Result<()> {
-        let archive = self.archive.clone();
+        let database = self.database.clone();
         let key = key(RECORDS, &registration.record);
         self.stage_with(objects, |tx| {
-            archive.auxiliary_compare_exchange(
+            database.auxiliary_compare_exchange(
                 tx,
                 &key,
                 registration.previous.as_deref(),

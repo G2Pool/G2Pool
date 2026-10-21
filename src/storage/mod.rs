@@ -45,7 +45,6 @@ pub struct Revision {
 pub struct Head {
     pub tip: Id,
     pub anchor: Anchor,
-    pub score: u128,
 }
 #[derive(Debug, Clone)]
 pub struct Object {
@@ -65,7 +64,7 @@ impl Object {
 }
 
 pub struct Store {
-    archive: crate::storage::sharechain::SharechainDb,
+    database: crate::storage::sharechain::SharechainDb,
     native: Option<(Arc<grin_chain::Chain>, crate::native::Profile)>,
     reader_deadline: Option<std::time::Instant>,
     path: PathBuf,
@@ -77,7 +76,7 @@ pub struct Store {
 }
 #[derive(Clone)]
 pub(crate) struct ReadSource {
-    archive: crate::storage::sharechain::SharechainDb,
+    database: crate::storage::sharechain::SharechainDb,
     deadline: std::time::Instant,
     path: PathBuf,
     native: Option<(Arc<grin_chain::Chain>, crate::native::Profile)>,
@@ -93,7 +92,7 @@ impl ReadSource {
             return Err(Error::Capacity("reader lifetime"));
         }
         Ok(Store {
-            archive: self.archive.clone(),
+            database: self.database.clone(),
             native: self.native.clone(),
             reader_deadline: Some(self.deadline),
             path: self.path.clone(),
@@ -169,7 +168,6 @@ impl Store {
         let mut index = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
             map_bytes,
-            crate::storage::sharechain::MAX_RECORD_BYTES,
             protocol,
         )
         .map_err(runtime_error)?;
@@ -185,7 +183,7 @@ impl Store {
             })
             .map_err(runtime_error)?;
         Ok(Self {
-            archive: index,
+            database: index,
             native: None,
             reader_deadline: None,
             path: path.to_owned(),
@@ -199,8 +197,8 @@ impl Store {
     pub(crate) fn runtime(&self) -> RuntimeStore {
         self.runtime.clone()
     }
-    pub(crate) fn archive(&self) -> crate::storage::sharechain::SharechainDb {
-        self.archive.clone()
+    pub(crate) fn database(&self) -> crate::storage::sharechain::SharechainDb {
+        self.database.clone()
     }
     fn check_reader(&self) -> Result<()> {
         if self
@@ -225,7 +223,7 @@ impl Store {
             None => Arc::new(self.runtime.snapshot().map_err(runtime_error)?),
         };
         Ok(ReadSource {
-            archive: self.archive.clone(),
+            database: self.database.clone(),
             deadline: self
                 .reader_deadline
                 .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(30)),
@@ -271,18 +269,6 @@ impl Store {
     }
     pub fn protocol(&self) -> Id {
         self.protocol
-    }
-    pub(crate) fn share_history(&self, parent: Option<Id>) -> Result<Vec<(u64, u128)>> {
-        let (chain, profile) = self
-            .native
-            .as_ref()
-            .ok_or(Error::Invalid("native history unavailable"))?;
-        let view =
-            crate::native::View::pin(chain, profile.clone(), chrono::Utc::now().timestamp())?;
-        let parent = parent
-            .map(Parent::Receipt)
-            .unwrap_or(Parent::Root(view.head.clone()));
-        crate::native::authenticated_history(&view, &parent, |key| self.read(key))
     }
     pub fn attach_native(
         &mut self,
@@ -424,7 +410,7 @@ impl Store {
             .map_err(runtime_error)?
             .into_iter()
             .map(|(tip, bytes)| {
-                if bytes.len() != 56 {
+                if bytes.len() != 40 {
                     return Err(Error::Invalid("stored head metadata"));
                 }
                 Ok(Head {
@@ -433,7 +419,6 @@ impl Store {
                         height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
                         hash: bytes[8..40].try_into().unwrap(),
                     },
-                    score: u128::from_be_bytes(bytes[40..].try_into().unwrap()),
                 })
             })
             .collect()
@@ -466,7 +451,7 @@ impl Store {
             return Err(Error::View);
         }
         let heads = snap.heads(self.limits.heads + 1).map_err(runtime_error)?;
-        let covered: Vec<Id> = heads
+        let mut covered: Vec<Id> = heads
             .iter()
             .filter(|(id, _)| {
                 *id != result.tip
@@ -480,7 +465,13 @@ impl Store {
         if !heads.iter().any(|(id, _)| *id == result.tip)
             && heads.len().saturating_sub(covered.len()) >= self.limits.heads
         {
-            return Err(Error::Capacity("materialized heads"));
+            if let Some(incumbent) = expected.tip.filter(|id| {
+                choose && heads.iter().any(|(head, _)| head == id) && !covered.contains(id)
+            }) {
+                covered.push(incumbent);
+            } else {
+                return Err(Error::Capacity("materialized heads"));
+            }
         }
         let parent = heads
             .iter()
@@ -507,7 +498,6 @@ impl Store {
         let removed: Vec<_> = old.difference(&required).copied().collect();
         let mut metadata = result.anchor.height.to_be_bytes().to_vec();
         metadata.extend(result.anchor.hash);
-        metadata.extend(result.score.to_be_bytes());
         let mut binding_bytes = metadata.clone();
         binding_bytes.extend(result.tip);
         let parent_binding = parent
@@ -564,15 +554,8 @@ impl Store {
             next.tip = Some(result.tip);
         }
         self.check_native(&expected.anchor)?;
-        let archive_generation = self
-            .archive
-            .read()
-            .map_err(runtime_error)?
-            .publication()
-            .map_err(runtime_error)?
-            .map_or(0, |publication| publication.generation);
         self.runtime
-            .apply_with(
+            .apply(
                 now(),
                 RuntimeBatch {
                     objects: &objects,
@@ -591,13 +574,6 @@ impl Store {
                         .then(|| (runtime_revision(expected), runtime_revision(&next))),
                     ..Default::default()
                 },
-                |tx| {
-                    if choose {
-                        self.archive
-                            .publish_head_in(tx, archive_generation, result.tip)?;
-                    }
-                    Ok(())
-                },
             )
             .map_err(runtime_error)?;
         Ok(next)
@@ -613,58 +589,46 @@ impl Store {
             .map_err(runtime_error)?;
         Ok(())
     }
-    pub fn acquisitions(&self, anchor: &Anchor) -> Result<Vec<Id>> {
-        let mut metadata = anchor.height.to_be_bytes().to_vec();
-        metadata.extend(anchor.hash);
+    pub fn acquisitions(&self) -> Result<Vec<Id>> {
         Ok(self
             .snapshot()?
             .leases(9)
             .map_err(runtime_error)?
             .into_iter()
-            .filter(|(_, expires, _, bytes)| *expires > now() && *bytes == metadata)
-            .map(|(tip, _, _, _)| tip)
+            .filter(|(_, expires, _)| *expires > now())
+            .map(|(tip, _, _)| tip)
             .collect())
     }
-    pub fn acquire(
-        &mut self,
-        tip: Id,
-        anchor: &Anchor,
-        keys: &BTreeSet<Key>,
-        max_keys: usize,
-    ) -> Result<()> {
+    pub fn acquire(&mut self, tip: Id, keys: &BTreeSet<Key>, max_keys: usize) -> Result<u64> {
         self.check_writer()?;
-        let mut metadata = anchor.height.to_be_bytes().to_vec();
-        metadata.extend(anchor.hash);
+        let now = now();
         let leases = self.snapshot()?.leases(9).map_err(runtime_error)?;
-        let mut release: Vec<_> = leases
+        let release: Vec<_> = leases
             .iter()
-            .filter(|(_, expires, _, bytes)| *expires <= now() || *bytes != metadata)
-            .map(|(id, _, _, _)| *id)
+            .filter(|(_, expires, _)| *expires <= now)
+            .map(|(id, _, _)| *id)
             .collect();
         let retained: Vec<_> = leases
             .iter()
-            .filter(|(id, _, _, _)| !release.contains(id))
+            .filter(|(id, _, _)| !release.contains(id))
             .collect();
-        if !retained.iter().any(|(id, _, _, _)| *id == tip) && retained.len() >= 8 {
-            if let Some((id, _, _, _)) = retained
-                .iter()
-                .filter(|(_, _, keys, _)| keys.len() <= 2)
-                .min_by_key(|(_, expires, _, _)| *expires)
-            {
-                release.push(*id);
-            } else {
-                return Err(Error::Capacity("acquisition tasks"));
-            }
+        if !retained.iter().any(|(id, _, _)| *id == tip) && retained.len() >= 8 {
+            return Err(Error::Capacity("acquisition tasks"));
         }
+        let deadline = match retained.iter().find(|(id, _, _)| *id == tip) {
+            Some((_, expires, _)) => *expires,
+            None => now
+                .checked_add(sharechain::ACQUISITION_LIFETIME)
+                .ok_or(Error::Capacity("acquisition deadline"))?,
+        };
         let keys: Vec<_> = keys.iter().copied().map(route).collect();
         self.runtime
             .apply(
-                now(),
+                now,
                 RuntimeBatch {
                     leases: &[RuntimeLease {
                         id: tip,
                         keys: &keys,
-                        metadata: &metadata,
                     }],
                     release_leases: &release,
                     lease_key_limit: Some(max_keys as u64),
@@ -672,7 +636,7 @@ impl Store {
                 },
             )
             .map_err(runtime_error)?;
-        Ok(())
+        Ok(deadline)
     }
     pub fn release_acquisition(&mut self, tip: Id) -> Result<()> {
         self.check_writer()?;

@@ -53,61 +53,6 @@ impl Node {
         let keep = self.collection_keep(extra)?;
         self.store.apply_compaction(result.compaction)?;
         let collected = self.store.collect(&keep, older_than)?;
-        let view = self.view()?;
-        let low = view.profile.finance_low(view.head.height);
-        let mut tips: BTreeSet<Id> = self
-            .store
-            .heads()?
-            .into_iter()
-            .map(|head| head.tip)
-            .collect();
-        tips.extend(self.tasks.keys().copied());
-        tips.extend(self.running.keys().copied());
-        tips.extend(
-            self.recovery
-                .iter()
-                .flat_map(|(origin, tip)| [*origin, *tip]),
-        );
-        tips.extend(self.store.acquisitions(&view.head)?);
-        if let Some(publication) = self.sharechain_publication()? {
-            tips.insert(publication.head);
-        }
-        let manifests: Vec<_> = self
-            .dependency_closure
-            .as_ref()
-            .map(|closure| closure.id())
-            .into_iter()
-            .collect();
-        let retained_tips: Vec<_> = tips.iter().copied().collect();
-        self.sharechain
-            .db()
-            .retire_obsolete_evaluation_bindings(low, &retained_tips, &manifests, 64)
-            .map_err(|_| Error::Invalid("sharechain evaluation retirement"))?;
-        self.sharechain
-            .db()
-            .drain_dependency_gc(usize::MAX)
-            .map_err(|_| Error::Invalid("sharechain dependency gc"))?;
-        if let Some(publication) = self.sharechain_publication()? {
-            let snapshot = self
-                .sharechain
-                .db()
-                .read()
-                .map_err(|_| Error::Invalid("sharechain snapshot"))?;
-            let head_height = snapshot
-                .header(&publication.head)
-                .map_err(|_| Error::Invalid("sharechain head"))?
-                .ok_or(Error::Missing(publication.head))?
-                .height;
-            let retain_from = head_height.saturating_sub(self.profile.validation_limit() as u64);
-            self.sharechain
-                .db()
-                .prune_unreferenced_bodies_bounded(publication.head, retain_from, 256)
-                .map_err(|_| Error::Invalid("sharechain body gc"))?;
-            self.sharechain
-                .db()
-                .prune_headers_bounded(&retained_tips, retain_from, 256)
-                .map_err(|_| Error::Invalid("sharechain header gc"))?;
-        }
         Ok(collected)
     }
 }

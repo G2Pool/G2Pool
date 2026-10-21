@@ -611,7 +611,12 @@ pub fn run(config: Config) -> Result<()> {
                         let pins = mining.pins()?;
                         node.lock()
                             .map_err(|_| Error::Invalid("node poisoned"))?
-                            .finish_maintenance(plan, chrono::Utc::now().timestamp() - 120, &pins)
+                            .finish_maintenance(
+                                plan,
+                                chrono::Utc::now().timestamp()
+                                    - crate::storage::sharechain::ACQUISITION_LIFETIME as i64,
+                                &pins,
+                            )
                     }
                     Err(error) => Err(error),
                 },

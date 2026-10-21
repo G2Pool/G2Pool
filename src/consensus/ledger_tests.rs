@@ -1,6 +1,6 @@
 use super::*;
 
-fn oracle_ids(ledger: &Ledger, low: u64, limits: window::WindowLimits) -> Vec<Id> {
+fn oracle_ids(ledger: &Ledger, low: u64, limits: WindowLimits) -> Vec<Id> {
     let mut out = Vec::new();
     let mut total = 0u128;
     let mut primaries = 0usize;
@@ -31,7 +31,7 @@ fn oracle_ids(ledger: &Ledger, low: u64, limits: window::WindowLimits) -> Vec<Id
 
 #[test]
 fn bounded_membership_matches_cold_after_expiry_and_fork() {
-    let mut warm = Ledger::new(10, 0);
+    let mut warm = Ledger::new(10);
     for frame in [
         frame(5, 10, Some(6), Some((1, 7))),
         frame(6, 8, Some(0), Some((2, 6))),
@@ -41,10 +41,10 @@ fn bounded_membership_matches_cold_after_expiry_and_fork() {
     }
     for low in [0, 7, 9] {
         let mut branch = warm.clone();
-        branch.advance(11, low).unwrap();
+        branch.rebase(11).unwrap();
         for receipts in [1, 2, 8] {
             for work in [1, 6, 10, 100] {
-                let limits = window::WindowLimits {
+                let limits = WindowLimits {
                     primary_limit: 8,
                     receipt_limit: receipts,
                     work_limit: Some(work),
@@ -55,7 +55,7 @@ fn bounded_membership_matches_cold_after_expiry_and_fork() {
             }
         }
     }
-    let limits = window::WindowLimits {
+    let limits = WindowLimits {
         primary_limit: 8,
         receipt_limit: 8,
         work_limit: Some(10),
@@ -77,23 +77,6 @@ fn bounded_membership_matches_cold_after_expiry_and_fork() {
     );
 }
 
-#[test]
-fn branch_state_tracks_retarget_samples_after_expiry() {
-    let mut ledger = Ledger::new(10, 0);
-    ledger.append(frame(5, 10, Some(6), Some((1, 7)))).unwrap();
-    ledger.append(frame(6, 8, Some(0), Some((2, 6)))).unwrap();
-    let history = ledger.retarget_history(8).unwrap();
-    assert_eq!(history.len(), 4);
-    assert!(history.iter().all(|(_, work)| *work > 0));
-    assert!(ledger
-        .retarget_history(1)
-        .unwrap()
-        .iter()
-        .any(|(time, _)| *time == 10));
-    ledger.advance(11, 9).unwrap();
-    assert_eq!(ledger.retarget_history(8).unwrap(), vec![(10, 8), (7, 2)]);
-}
-
 fn frame(id: u8, height: u64, parent: Option<u8>, uncle: Option<(u8, u64)>) -> Arc<Frame> {
     let primary = Contribution {
         id: [id; 32],
@@ -101,6 +84,7 @@ fn frame(id: u8, height: u64, parent: Option<u8>, uncle: Option<(u8, u64)>) -> A
         timestamp: height,
         difficulty: u64::from(id) + 1,
         class: 0,
+        depth: 0,
     };
     let uncles = uncle
         .into_iter()
@@ -110,6 +94,7 @@ fn frame(id: u8, height: u64, parent: Option<u8>, uncle: Option<(u8, u64)>) -> A
             timestamp: height,
             difficulty: u64::from(id) + 1,
             class: 1,
+            depth: 1,
         })
         .collect();
     Arc::new(Frame {
@@ -121,94 +106,110 @@ fn frame(id: u8, height: u64, parent: Option<u8>, uncle: Option<(u8, u64)>) -> A
     })
 }
 
-fn assert_cold(ledger: &Ledger, chain: &[Arc<Frame>], low: u64) {
-    let frames: Vec<_> = chain.iter().filter(|frame| frame.height() >= low).collect();
-    let entries: Vec<_> = frames
-        .iter()
-        .flat_map(|frame| frame.contributions())
-        .collect();
-    let active: Vec<_> = entries.iter().filter(|entry| entry.height >= low).collect();
-    assert_eq!(ledger.full(), active.iter().map(|entry| entry.id).collect());
-    assert_eq!(
-        ledger.score,
-        active
-            .iter()
-            .map(|entry| u128::from(entry.difficulty))
-            .sum()
-    );
-    assert_eq!(ledger.seen, entries.iter().map(|entry| entry.id).collect());
-    assert_eq!(
-        ledger.spine,
-        frames.iter().map(|frame| frame.id()).collect()
-    );
-    assert_eq!(
-        ledger
-            .frames
-            .iter()
-            .map(|frame| frame.id())
-            .collect::<Vec<_>>(),
-        frames.iter().map(|frame| frame.id()).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ledger.boundary,
-        chain
-            .iter()
-            .find(|frame| frame.height() < low)
-            .map(|frame| frame.id())
-    );
-}
-
 #[test]
-fn branch_undo_and_age_deltas_equal_cold_recomputation() {
-    for low in 0..=11 {
-        for fork in low..=11 {
-            let mut chain: Vec<_> = (0..12)
-                .rev()
-                .map(|id| {
-                    frame(
-                        id,
-                        u64::from(id),
-                        id.checked_sub(1),
-                        Some((id + 32, u64::from(id.saturating_sub(2)))),
-                    )
-                })
-                .collect();
-            let mut ledger = Ledger::new(11, 0);
-            for frame in &chain {
-                ledger.append(frame.clone()).unwrap();
+fn rolling_pruning_matches_cold_recomputation() {
+    for window in 1..=12 {
+        let mut warm = Ledger::new(0);
+        let mut chain = Vec::new();
+        for n in 0..48u8 {
+            warm.rebase(u64::from(n)).unwrap();
+            let next = frame(
+                n,
+                u64::from(n),
+                n.checked_sub(1),
+                Some((n + 128, u64::from(n.saturating_sub(2)))),
+            );
+            warm.prepend(next.clone()).unwrap();
+            chain.insert(0, next);
+            warm.trim(window);
+            let mut cold = Ledger::new(u64::from(n));
+            for frame in chain.iter().take(window) {
+                cold.append(frame.clone()).unwrap();
             }
-            ledger.advance(12, u64::from(low)).unwrap();
-            assert_cold(&ledger, &chain, u64::from(low));
-            ledger.rewind_to([fork; 32]);
-            chain.retain(|frame| frame.height() <= u64::from(fork));
-            let replacement = frame(80, 12, Some(fork), Some((81, 12)));
-            ledger.prepend(replacement.clone()).unwrap();
-            chain.insert(0, replacement);
-            assert_cold(&ledger, &chain, u64::from(low));
-            ledger.advance(14, 12).unwrap();
-            assert_cold(&ledger, &chain, 12);
+            cold.boundary = chain.get(window).map(|frame| frame.id());
+            assert_eq!(warm.spine, cold.spine);
+            assert_eq!(warm.seen, cold.seen);
+            assert_eq!(warm.boundary, cold.boundary);
+            assert_eq!(
+                warm.window_score(window, 0).unwrap(),
+                cold.window_score(window, 0).unwrap()
+            );
+            let limits = WindowLimits {
+                primary_limit: window,
+                receipt_limit: 8,
+                work_limit: Some(1000),
+            };
+            let low = u64::from(n.saturating_sub(2));
+            assert_eq!(
+                warm.window_ids(low, limits).unwrap(),
+                cold.window_ids(low, limits).unwrap()
+            );
         }
     }
 }
 
 #[test]
-fn expired_uncle_still_blocks_duplicates_until_its_frame_is_removed() {
-    let mut ledger = Ledger::new(5, 0);
+fn uncle_still_blocks_duplicates_until_its_frame_is_removed() {
+    let mut ledger = Ledger::new(5);
     ledger.append(frame(1, 5, None, Some((2, 1)))).unwrap();
-    ledger.advance(6, 3).unwrap();
-    assert_eq!(ledger.full(), BTreeSet::from([[1; 32]]));
-    let before = (ledger.score, ledger.seen.clone(), ledger.full());
+    ledger.rebase(6).unwrap();
+    assert_eq!(ledger.full(0), BTreeSet::from([[1; 32], [2; 32]]));
+    let before = (ledger.seen.clone(), ledger.full(0));
     assert!(matches!(
         ledger.prepend(frame(3, 6, Some(1), Some((2, 1)))),
         Err(Error::Invalid("duplicate contribution"))
     ));
-    assert_eq!((ledger.score, ledger.seen.clone(), ledger.full()), before);
-    ledger.advance(8, 6).unwrap();
+    assert_eq!((ledger.seen.clone(), ledger.full(0)), before);
+    ledger.rebase(8).unwrap();
+    ledger.trim(0);
     assert!(ledger.frames.is_empty());
     assert!(!ledger.seen.contains(&[2; 32]));
     ledger.prepend(frame(3, 8, Some(1), Some((2, 1)))).unwrap();
-    assert_eq!(ledger.full(), BTreeSet::from([[3; 32]]));
-    let before = (ledger.height, ledger.score, ledger.full());
-    assert!(matches!(ledger.advance(7, 5), Err(Error::View)));
-    assert_eq!((ledger.height, ledger.score, ledger.full()), before);
+    assert_eq!(ledger.full(0), BTreeSet::from([[3; 32], [2; 32]]));
+    let before = (ledger.height, ledger.full(0));
+    assert!(matches!(ledger.rebase(7), Err(Error::View)));
+    assert_eq!((ledger.height, ledger.full(0)), before);
+}
+
+#[test]
+fn uncle_credit_uses_share_distance_at_the_window_boundary() {
+    let mut ledger = Ledger::new(5);
+    for n in (0..=10u8).rev() {
+        let mut next = frame(n, 5, n.checked_sub(1), (n == 10).then_some((200, 5)));
+        if n == 10 {
+            Arc::get_mut(&mut next).unwrap().uncles[0].depth = 8;
+        }
+        ledger.append(next).unwrap();
+    }
+    assert!(!ledger.recent(8, 0).any(|entry| entry.id == [200; 32]));
+    assert!(ledger.recent(9, 0).any(|entry| entry.id == [200; 32]));
+    ledger.trim(8);
+    assert!(ledger.full(0).contains(&[200; 32]));
+    assert!(!ledger.recent(8, 0).any(|entry| entry.id == [200; 32]));
+}
+
+#[test]
+fn fresh_work_credit_preserves_older_financial_contributions() {
+    let mut ledger = Ledger::new(100);
+    ledger
+        .append(frame(6, 100, Some(5), Some((200, 94))))
+        .unwrap();
+    ledger.append(frame(5, 94, Some(4), None)).unwrap();
+    ledger.append(frame(4, 90, None, None)).unwrap();
+    assert_eq!(ledger.window_score(3, 95).unwrap(), 7);
+    assert_eq!(
+        ledger.full(90),
+        BTreeSet::from([[6; 32], [200; 32], [5; 32], [4; 32]])
+    );
+    let limits = WindowLimits {
+        primary_limit: 3,
+        receipt_limit: 8,
+        work_limit: None,
+    };
+    assert_eq!(
+        ledger.window_ids(90, limits).unwrap(),
+        vec![[6; 32], [200; 32], [5; 32], [4; 32]]
+    );
+    assert_eq!(ledger.full(95), BTreeSet::from([[6; 32]]));
+    assert_eq!(ledger.window_ids(95, limits).unwrap(), vec![[6; 32]]);
 }

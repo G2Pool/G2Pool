@@ -83,7 +83,7 @@ impl<S: Source> Validator<'_, '_, S> {
             });
             if reusable {
                 let low = self.view.profile.finance_low(anchor);
-                let limits = crate::consensus::window::WindowLimits {
+                let limits = ledger::WindowLimits {
                     primary_limit: primary_limit.unwrap_or(usize::MAX),
                     receipt_limit: limit.unwrap_or(usize::MAX),
                     work_limit,
@@ -159,9 +159,7 @@ impl<S: Source> Validator<'_, '_, S> {
                     .checked_add(u128::from(item.job.difficulty))
                     .ok_or(Error::Invalid("window work overflow"))?;
                 out.push((item, class));
-                if limit == Some(out.len())
-                    || (class == 0 && work_limit.is_some_and(|limit| total_work >= limit))
-                {
+                if limit == Some(out.len()) || work_limit.is_some_and(|limit| total_work >= limit) {
                     return Ok(out);
                 }
             }

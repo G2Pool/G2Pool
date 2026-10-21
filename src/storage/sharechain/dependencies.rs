@@ -155,18 +155,6 @@ fn prefix(key: DependencyKey, depth: usize) -> DependencyKey {
 }
 
 impl DependencyDb {
-    pub(crate) fn open(env: &Env<WithoutTls>, tx: &mut RwTxn<'_>) -> Result<Self> {
-        Ok(Self {
-            nodes: env.create_database(tx, Some("dependency_trie_nodes"))?,
-            gc: env.create_database(tx, Some("dependency_gc"))?,
-            refs: env.create_database(tx, Some("dependency_trie_refs"))?,
-            roots: env.create_database(tx, Some("dependency_roots"))?,
-            objects: env.create_database(tx, Some("dependency_objects"))?,
-            object_refs: env.create_database(tx, Some("dependency_object_refs"))?,
-            manifest_digests: env.create_database(tx, Some("dependency_manifest_digests"))?,
-            digests: env.create_database(tx, Some("dependency_digests"))?,
-        })
-    }
     pub(crate) fn open_runtime(env: &Env<WithoutTls>, tx: &mut RwTxn<'_>) -> Result<Self> {
         Ok(Self {
             nodes: env.create_database(tx, Some("runtime_trie_nodes"))?,
@@ -210,6 +198,7 @@ impl DependencyDb {
     pub(crate) fn retained(&self, tx: &RoTxn<'_, WithoutTls>, id: &Id) -> Result<bool> {
         Ok(self.roots.get(tx, id)?.is_some())
     }
+    #[cfg(test)]
     pub(crate) fn object<'a>(
         &self,
         tx: &'a RoTxn<'_, WithoutTls>,

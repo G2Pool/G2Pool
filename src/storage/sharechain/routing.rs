@@ -5,8 +5,6 @@ impl SharechainDb {
     const PEER_LIMIT: usize = 448;
     const PEER_KEY_BYTES: usize = 70;
     const PEER_VALUE_BYTES: usize = 1024;
-    const COMPACT_PREFIX: &'static [u8] = b"sync/compact/";
-    const COMPACT_VALUE_BYTES: usize = 512;
 
     pub fn read_peers(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.auxiliary_read_prefix(
@@ -66,62 +64,9 @@ impl SharechainDb {
                 self.runtime.put(&mut txn, key, value)?;
             }
         }
-        let endpoints: std::collections::BTreeSet<_> = records
-            .iter()
-            .map(|(key, _)| &key[Self::PEER_PREFIX.len()..])
-            .collect();
-        let mut orphaned = Vec::new();
-        for row in self.runtime.prefix_iter(&txn, Self::COMPACT_PREFIX)? {
-            let (key, _) = row?;
-            if key
-                .get(Self::COMPACT_PREFIX.len() + 32..)
-                .is_none_or(|endpoint| !endpoints.contains(endpoint))
-            {
-                orphaned.push(key.to_vec());
-            }
-        }
-        for key in orphaned {
-            self.runtime.delete(&mut txn, &key)?;
-        }
         self.budget.check(&txn, previous_bytes, 0)?;
         txn.commit()?;
         Ok(())
-    }
-
-    fn compact_key(protocol: Id, address: &str) -> Result<Vec<u8>> {
-        if address.is_empty() || address.len() > 256 {
-            return Err(Error::Invalid("compact cursor key"));
-        }
-        let mut key = Self::COMPACT_PREFIX.to_vec();
-        key.extend(protocol);
-        key.extend(address.as_bytes());
-        Ok(key)
-    }
-
-    pub fn read_compact_cursor(&self, protocol: Id, address: &str) -> Result<Option<Vec<u8>>> {
-        let key = Self::compact_key(protocol, address)?;
-        let txn = self.env.read_txn()?;
-        let value = self.runtime.get(&txn, &key)?;
-        if value.is_some_and(|v| v.len() > Self::COMPACT_VALUE_BYTES) {
-            return Err(Error::Invalid("compact cursor bounds"));
-        }
-        Ok(value.map(ToOwned::to_owned))
-    }
-
-    pub fn write_compact_cursor(
-        &self,
-        protocol: Id,
-        address: &str,
-        value: Option<&[u8]>,
-    ) -> Result<()> {
-        let key = Self::compact_key(protocol, address)?;
-        match value {
-            Some(value) if value.len() <= Self::COMPACT_VALUE_BYTES => {
-                self.auxiliary_write(&key, value)
-            }
-            Some(_) => Err(Error::Invalid("compact cursor bounds")),
-            None => self.auxiliary_delete(&key),
-        }
     }
 
     pub(crate) fn auxiliary_read_prefix(
@@ -182,12 +127,14 @@ impl SharechainDb {
         self.runtime.put(tx, key, value)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn auxiliary_write(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.auxiliary_transaction(|tx, db| {
             db.put(tx, key, value)?;
             Ok(())
         })
     }
+    #[cfg(test)]
     pub(crate) fn auxiliary_delete(&self, key: &[u8]) -> Result<()> {
         self.auxiliary_transaction(|tx, db| {
             db.delete(tx, key)?;

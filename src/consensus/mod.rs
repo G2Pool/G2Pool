@@ -1,15 +1,11 @@
 mod candidate;
-mod closure;
-pub use closure::{decode_dependency, ClosureObjects, VerifiedClosure};
-pub mod coordinator;
 mod ledger;
-use ledger::Ledger;
+pub(crate) use ledger::Ledger;
 mod payout;
 pub use payout::output_bound;
 mod session;
 mod topology;
 mod trace;
-mod window;
 pub use session::{EvaluationProgress, Session};
 use trace::Trace;
 
@@ -65,10 +61,8 @@ impl PayoutState {
 pub struct Evaluation {
     pub tip: Id,
     pub anchor: Anchor,
-    pub score: u128,
     pub financial: Financial,
     pub full: BTreeSet<Id>,
-    pub closure: BTreeSet<Id>,
     pub(crate) primary: BTreeSet<Id>,
     pub required: BTreeSet<Key>,
     pub cost: Cost,
@@ -155,6 +149,7 @@ pub(crate) struct Facts {
     work: OrdMap<Id, Arc<Work>>,
     registrations: OrdMap<Id, RegistrationFacts>,
     historical: OrdMap<(u64, Id, Point), bool>,
+    targets: OrdMap<Id, Arc<Trace>>,
     completed: OrdMap<Id, Arc<Trace>>,
     payload_bytes: usize,
     work_bytes: usize,
@@ -203,69 +198,13 @@ fn extend_missing<K: Clone + Ord, V: Clone>(
 }
 
 impl Facts {
-    pub(crate) fn verified_closure(
-        &self,
-        evaluation: &Evaluation,
-        parent: Option<&VerifiedClosure>,
-    ) -> Result<VerifiedClosure> {
-        VerifiedClosure::from_facts(evaluation, self, parent)
-    }
     pub(crate) fn work(&self, id: Id) -> Option<&Work> {
         self.work.get(&id).map(Arc::as_ref)
     }
+    pub(crate) fn branch(&self) -> Option<&Ledger> {
+        self.topology.as_deref()
+    }
 
-    pub(crate) fn compact_share(&self, tip: Id) -> Result<(Arc<Work>, Vec<u8>)> {
-        let work = self
-            .work
-            .get(&tip)
-            .cloned()
-            .ok_or(Error::Unavailable(Key::new(Kind::Core, tip)))?;
-        let body = self
-            .loaded
-            .get(&Key::new(Kind::Core, tip))
-            .cloned()
-            .ok_or(Error::Unavailable(Key::new(Kind::Core, tip)))?
-            .to_vec();
-        Ok((work, body))
-    }
-    pub(crate) fn uncle_work(&self, id: Id) -> Result<Arc<Work>> {
-        self.work
-            .get(&id)
-            .cloned()
-            .ok_or(Error::Unavailable(Key::new(Kind::Core, id)))
-    }
-    pub(crate) fn compact_chain(
-        &self,
-        tip: Id,
-        limit: usize,
-        mut indexed: impl FnMut(Id) -> Result<bool>,
-    ) -> Result<Vec<(Arc<Work>, Vec<u8>)>> {
-        if limit == 0 {
-            return Err(Error::Invalid("compact ancestry limit"));
-        }
-        let mut chain = Vec::new();
-        let mut cursor = Some(tip);
-        let mut seen = BTreeSet::new();
-        while let Some(id) = cursor {
-            if indexed(id)? {
-                break;
-            }
-            if !seen.insert(id) {
-                return Err(Error::Invalid("compact ancestry cycle"));
-            }
-            if seen.len() > limit {
-                return Err(Error::Expired);
-            }
-            let (work, body) = self.compact_share(id)?;
-            cursor = match work.job().parent {
-                Parent::Root(_) => None,
-                Parent::Receipt(parent) => Some(parent),
-            };
-            chain.push((work, body));
-        }
-        chain.reverse();
-        Ok(chain)
-    }
     pub(crate) fn has_active_tip(&self, low: u64) -> bool {
         self.topology.as_ref().is_some_and(|ledger| {
             ledger
@@ -290,6 +229,9 @@ impl Facts {
         });
         extend_missing(&mut facts.coupons, &self.coupons, |_| 0);
         extend_missing(&mut facts.historical, &self.historical, |_| 0);
+        facts.certificate_bytes += extend_missing(&mut facts.targets, &self.targets, |trace| {
+            trace.own_metadata()
+        });
         facts.certificate_bytes += extend_missing(&mut facts.completed, &self.completed, |trace| {
             trace.own_metadata()
         });
@@ -321,6 +263,11 @@ impl Facts {
             &mut self.work,
             |id, _| required.contains(&Key::new(Kind::Core, *id)),
             |work| work.retained_bytes(),
+        );
+        self.certificate_bytes -= retain_ord_map(
+            &mut self.targets,
+            |id, _| required.contains(&Key::new(Kind::Core, *id)),
+            |trace| trace.own_metadata(),
         );
         self.certificate_bytes -= retain_ord_map(
             &mut self.completed,
@@ -360,12 +307,12 @@ pub struct Validator<'a, 'v, S: Source> {
     view: &'a View<'v>,
     budget: Budget,
     required: BTreeSet<Key>,
-    closure: BTreeSet<Id>,
     facts: Facts,
     reuse_plans: bool,
     traces: Vec<Arc<Trace>>,
     acquired: BTreeSet<Key>,
     required_traces: BTreeMap<usize, Arc<Trace>>,
+    history: BTreeMap<Id, (usize, usize)>,
 }
 impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
     pub fn bounded(
@@ -379,12 +326,12 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
             view,
             budget: Budget::new(limits, cancel),
             required: BTreeSet::new(),
-            closure: BTreeSet::new(),
             facts: Facts::default(),
             reuse_plans: false,
             traces: vec![],
             acquired: BTreeSet::new(),
             required_traces: BTreeMap::new(),
+            history: BTreeMap::new(),
         }
     }
     pub(crate) fn seed(&mut self, facts: &Facts) {
@@ -401,8 +348,7 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
         self.facts
             .bytes()
             .saturating_add(self.required.len() * 128)
-            .saturating_add(self.closure.len() * 96)
-            .saturating_add(self.required_traces.len() * 128)
+            .saturating_add(self.required_traces.len() * 128 + self.history.len() * 128)
             .saturating_add(self.traces.capacity() * std::mem::size_of::<Arc<Trace>>())
     }
     fn read(&mut self, key: Key) -> Result<Arc<[u8]>> {
@@ -431,22 +377,54 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
         decode(&self.read(Key::new(T::KIND, id))?)
     }
     fn retarget_history(&mut self, parent: &Parent) -> Result<Vec<(u64, u128)>> {
-        if let Parent::Receipt(tip) = parent {
-            if let Some(ledger) = self.facts.topology.as_ref() {
-                if ledger
-                    .frames
-                    .front()
-                    .is_some_and(|frame| frame.id() == *tip)
-                    && ledger.can_retarget(self.view.profile.work_window_limit())
-                {
-                    let history = ledger.retarget_history(self.view.profile.work_window_limit())?;
-                    if history.len() >= 2 {
-                        return Ok(history);
-                    }
+        let view = self.view;
+        native::authenticated_history(view, parent, |id| self.authenticated(id))
+    }
+    pub(crate) fn share_difficulty(&mut self, parent: &Parent, anchor: &Anchor) -> Result<u64> {
+        let target = self.view.target(anchor)?.difficulty.to_num();
+        let history = self.retarget_history(parent)?;
+        self.view.profile.retargeted(
+            target,
+            anchor
+                .height
+                .checked_add(1)
+                .ok_or(Error::Invalid("height overflow"))?,
+            &history,
+            u64::from(self.view.profile.manifest.share_target_seconds),
+        )
+    }
+    fn require_history(&mut self, parent: &Parent) -> Result<()> {
+        let window = self.view.profile.work_window_limit();
+        let mut primary = window + usize::from(self.view.profile.manifest.uncle_depth);
+        let mut uncles = window;
+        let mut cursor = parent.clone();
+        let mut visited = Vec::new();
+        while let Parent::Receipt(id) = cursor {
+            if primary == 0
+                || self
+                    .history
+                    .get(&id)
+                    .is_some_and(|&(p, u)| p >= primary && u >= uncles)
+            {
+                break;
+            }
+            let work = self.authenticated(id)?;
+            if uncles > 0 {
+                for uncle in &work.job().uncles.0 {
+                    self.authenticated(*uncle)?;
                 }
             }
+            visited.push((id, primary, uncles));
+            primary -= 1;
+            uncles = uncles.saturating_sub(1);
+            cursor = work.job().parent.clone();
         }
-        native::authenticated_history(self.view, parent, |key| self.read(key))
+        for (id, primary, uncles) in visited {
+            let entry = self.history.entry(id).or_default();
+            entry.0 = entry.0.max(primary);
+            entry.1 = entry.1.max(uncles);
+        }
+        Ok(())
     }
     fn coupon(&mut self, id: Id) -> Result<Arc<CouponMaterial>> {
         if let Some(material) = self.facts.material.get(&id).cloned() {
@@ -464,49 +442,62 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
         self.facts.material.insert(id, material.clone());
         Ok(material)
     }
-    fn work(&mut self, id: Id) -> Result<Arc<Work>> {
+    fn authenticated(&mut self, id: Id) -> Result<Arc<Work>> {
         self.budget.check()?;
-        self.closure.insert(id);
+        let bytes = self.read(Key::new(Kind::Core, id))?;
+        let authorization = self.read(Key::new(Kind::Authorization, id))?;
         if let Some(core) = self.facts.work.get(&id).cloned() {
-            self.view.anchor(&core.job().anchor)?;
             if core.job().timestamp
                 > self
                     .view
                     .now
-                    .checked_add(i64::from(self.view.profile.manifest.future_seconds))
-                    .ok_or(Error::Invalid("clock overflow"))?
+                    .saturating_add(i64::from(self.view.profile.manifest.future_seconds))
             {
                 return Err(Error::Future);
             }
-            self.read(Key::new(Kind::Core, id))?;
-            self.read(Key::new(Kind::Authorization, id))?;
             return Ok(core);
         }
-        let bytes = self.read(Key::new(Kind::Core, id))?;
-        let auth: WorkAuthorization = decode(&self.read(Key::new(Kind::Authorization, id))?)
-            .map_err(|_| Error::Witness("work authorization encoding"))?;
         self.budget.work()?;
-        let decoded: Core = decode(&bytes)?;
-        let decoded_job: Job = decode(&decoded.job.0)?;
-        let target = self.view.target(&decoded_job.anchor)?.difficulty.to_num();
-        let history = self.retarget_history(&decoded_job.parent)?;
-        let assigned = self.view.profile.retargeted(
-            target,
-            native::parse::<grin_core::core::BlockHeader>(&decoded.header.0)?.height,
-            &history,
-            u64::from(self.view.profile.manifest.share_target_seconds),
-        )?;
-        let core = Work::verify_with_target(&bytes, self.view, Some(assigned))?;
-        if core.job().difficulty != assigned {
-            return Err(Error::Invalid("assigned target"));
-        }
+        let core = Work::verify(&bytes, self.view)?;
         if core.id() != id {
             return Err(Error::Invalid("core lookup identity"));
         }
+        let auth: WorkAuthorization =
+            decode(&authorization).map_err(|_| Error::Witness("work authorization encoding"))?;
         core.authorize(&auth, self.view.profile.protocol)?;
         let core = Arc::new(core);
-        self.facts.work_bytes = self.facts.work_bytes.saturating_add(core.retained_bytes());
+        self.facts.work_bytes += core.retained_bytes();
         self.facts.work.insert(id, core.clone());
+        Ok(core)
+    }
+    fn work(&mut self, id: Id) -> Result<Arc<Work>> {
+        let mark = self.traces.len();
+        let core = self.authenticated(id)?;
+        let trace = self.facts.targets.get(&id).cloned();
+        if trace.as_ref().is_none_or(|trace| {
+            !self
+                .required_traces
+                .contains_key(&(Arc::as_ptr(trace) as usize))
+        }) {
+            if trace.is_none() {
+                let assigned = self.share_difficulty(&core.job().parent, &core.job().anchor)?;
+                if core.job().difficulty != assigned {
+                    return Err(Error::Invalid("assigned target"));
+                }
+            } else {
+                self.require_history(&core.job().parent)?;
+            }
+        }
+        let trace = trace.unwrap_or_else(|| {
+            let trace = Trace::target(id);
+            self.facts.certificate_bytes += trace.own_metadata();
+            self.facts.targets.insert(id, trace.clone());
+            trace
+        });
+        self.required_traces
+            .insert(Arc::as_ptr(&trace) as usize, trace.clone());
+        self.traces.truncate(mark);
+        self.traces.push(trace);
         Ok(core)
     }
     fn require(&mut self, trace: &Arc<Trace>) -> Result<()> {
@@ -523,9 +514,12 @@ impl<'a, 'v, S: Source> Validator<'a, 'v, S> {
                 stack.extend(node.children.iter().cloned().map(|child| (child, false)));
                 continue;
             }
+            if let Some(id) = node.target {
+                self.work(id)?;
+            }
             for key in &node.keys {
                 if key.kind == Kind::Core {
-                    self.work(key.id)?;
+                    self.authenticated(key.id)?;
                 } else {
                     self.read(*key)?;
                 }

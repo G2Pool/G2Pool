@@ -1,6 +1,5 @@
 use crate::{
     codec::Id,
-    network::chain_sync::Header,
     objects::{Key, Kind},
     storage::Object,
     Error, Result,
@@ -9,7 +8,6 @@ use std::{collections::BTreeSet, net::SocketAddr};
 pub(super) const FRAME: usize = 16 * 1024 * 1024;
 pub(crate) const REQUEST_KEYS: usize = 32;
 pub(crate) const MAX_TIPS: usize = 64;
-pub(crate) use super::chain_sync::MAX_HEADERS;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -25,16 +23,6 @@ pub enum Message {
         deferred: Vec<Key>,
     },
     Notice(Vec<Id>),
-    Locator {
-        target: Id,
-        start: Id,
-        locator: Vec<Id>,
-    },
-    Headers {
-        target: Id,
-        start: Id,
-        headers: Vec<Header>,
-    },
     Ack,
     Busy,
 }
@@ -132,45 +120,6 @@ impl Message {
                     out.extend(id);
                 }
             }
-            Self::Locator {
-                target,
-                start,
-                locator: ids,
-            } => {
-                if ids.is_empty() || ids.len() > crate::network::chain_sync::MAX_LOCATOR {
-                    return Err(Error::Capacity("sharechain locator"));
-                }
-                out.extend([11]);
-                out.extend(target);
-                out.extend(start);
-                out.push(ids.len() as u8);
-                for id in ids {
-                    out.extend(id);
-                }
-            }
-            Self::Headers {
-                target,
-                start,
-                headers,
-            } => {
-                if headers.len() > MAX_HEADERS {
-                    return Err(Error::Capacity("sharechain headers"));
-                }
-                out.extend([12]);
-                out.extend(target);
-                out.extend(start);
-                out.push(headers.len() as u8);
-                for header in headers {
-                    out.extend(header.id);
-                    out.push(u8::from(header.parent.is_some()));
-                    out.extend(header.parent.unwrap_or([0; 32]));
-                    out.extend(header.height.to_be_bytes());
-                    out.extend(header.credited_work.to_be_bytes());
-                    out.extend(header.cumulative_work.to_be_bytes());
-                    out.extend(header.parent_state_root);
-                    out.extend(header.state_root);
-                }
-            }
             Self::Get(keys) => {
                 if keys.iter().copied().collect::<BTreeSet<_>>().len() != keys.len() {
                     return Err(Error::Invalid("duplicate request key"));
@@ -262,60 +211,6 @@ impl Message {
                     Self::Notice(tips)
                 }
             }
-            11 => {
-                let target = r.id()?;
-                let start = r.id()?;
-                let n = r.byte()? as usize;
-                if n == 0 || n > crate::network::chain_sync::MAX_LOCATOR {
-                    return Err(Error::Invalid("sharechain locator length"));
-                }
-                let mut ids = Vec::with_capacity(n);
-                for _ in 0..n {
-                    ids.push(r.id()?);
-                }
-                Self::Locator {
-                    target,
-                    start,
-                    locator: ids,
-                }
-            }
-            12 => {
-                let target = r.id()?;
-                let start = r.id()?;
-                let n = r.byte()? as usize;
-                if n > MAX_HEADERS {
-                    return Err(Error::Invalid("sharechain header count"));
-                }
-                let mut headers = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let id = r.id()?;
-                    let parent_bytes = r.take(33)?;
-                    let parent = match parent_bytes[0] {
-                        0 => {
-                            if parent_bytes[1..] != [0; 32] {
-                                return Err(Error::Invalid("sharechain root parent"));
-                            }
-                            None
-                        }
-                        1 => Some(parent_bytes[1..].try_into().unwrap()),
-                        _ => return Err(Error::Invalid("sharechain parent tag")),
-                    };
-                    headers.push(Header {
-                        id,
-                        parent,
-                        height: u64::from_be_bytes(r.take(8)?.try_into().unwrap()),
-                        credited_work: u128::from_be_bytes(r.take(16)?.try_into().unwrap()),
-                        cumulative_work: u128::from_be_bytes(r.take(16)?.try_into().unwrap()),
-                        parent_state_root: r.id()?,
-                        state_root: r.id()?,
-                    });
-                }
-                Self::Headers {
-                    target,
-                    start,
-                    headers,
-                }
-            }
             2 => {
                 let n = r.byte()?;
                 if n as usize > REQUEST_KEYS {
@@ -383,68 +278,6 @@ impl Message {
             | (Self::Peers | Self::Announce(_), Self::Addresses(_))
             | (Self::Notice(_), Self::Ack) => Ok(()),
             (
-                Self::Locator {
-                    target,
-                    start,
-                    locator,
-                },
-                Self::Headers {
-                    target: response_target,
-                    start: response_start,
-                    headers,
-                },
-            ) => {
-                if target != response_target || start != response_start {
-                    return Err(Error::Invalid("sharechain page correlation"));
-                }
-                if headers.len() > MAX_HEADERS {
-                    return Err(Error::Invalid("sharechain header count"));
-                }
-                let continuation = *start != [0; 32];
-                if headers.is_empty() {
-                    if (continuation && target != start)
-                        || (!continuation && !locator.contains(target))
-                    {
-                        return Err(Error::Invalid("sharechain page progress"));
-                    }
-                } else if target == start {
-                    return Err(Error::Invalid("sharechain page past target"));
-                }
-                if let Some(first) = headers.first() {
-                    let boundary = first.parent.filter(|parent| {
-                        if continuation {
-                            parent == start
-                        } else {
-                            locator.contains(parent)
-                        }
-                    });
-                    if first.credited_work == 0 || boundary.is_none() {
-                        return Err(Error::Invalid("sharechain reply boundary"));
-                    }
-                    let mut seen = BTreeSet::from([boundary.unwrap()]);
-                    for (offset, header) in headers.iter().enumerate() {
-                        if !seen.insert(header.id) || header.parent == Some(header.id) {
-                            return Err(Error::Invalid("sharechain header cycle"));
-                        }
-                        if header.id == *target && offset + 1 != headers.len() {
-                            return Err(Error::Invalid("sharechain page past target"));
-                        }
-                    }
-                }
-                for pair in headers.windows(2) {
-                    if pair[1].parent != Some(pair[0].id)
-                        || pair[0].height.checked_add(1) != Some(pair[1].height)
-                        || pair[1].credited_work == 0
-                        || pair[0].cumulative_work.checked_add(pair[1].credited_work)
-                            != Some(pair[1].cumulative_work)
-                        || pair[1].parent_state_root != pair[0].state_root
-                    {
-                        return Err(Error::Invalid("sharechain reply ancestry"));
-                    }
-                }
-                Ok(())
-            }
-            (
                 Self::Get(keys),
                 Self::Reply {
                     objects,
@@ -474,7 +307,6 @@ impl Message {
     pub(super) fn response_ceiling(&self) -> Result<usize> {
         Ok(match self {
             Self::Heads => 2 + MAX_TIPS * 32,
-            Self::Locator { .. } => super::chain_sync::HEADERS_FRAME,
             Self::Peers | Self::Announce(_) => 2 + 16 * 65,
             Self::Notice(_) => 1,
             Self::Get(keys) => {
@@ -498,7 +330,6 @@ impl Message {
             || matches!(
                 (self, tag),
                 (Self::Heads, 1)
-                    | (Self::Locator { .. }, 12)
                     | (Self::Peers | Self::Announce(_), 7)
                     | (Self::Get(_), 3)
                     | (Self::Notice(_), 9)

@@ -11,7 +11,7 @@ fn limits() -> RuntimeLimits {
     }
 }
 fn open(path: &std::path::Path) -> SharechainDb {
-    SharechainDb::open(path, 16 * 1024 * 1024, 1000, [7; 32]).unwrap()
+    SharechainDb::open(path, 16 * 1024 * 1024, [7; 32]).unwrap()
 }
 
 #[test]
@@ -63,7 +63,6 @@ fn quota_failure_rolls_back_every_namespace() {
         0,
         RuntimeBatch {
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [2; 32],
                 keys: &[rk(2)],
             }],
@@ -72,7 +71,6 @@ fn quota_failure_rolls_back_every_namespace() {
     )
     .unwrap();
     let lease = RuntimeLease {
-        metadata: &[],
         id: [1; 32],
         keys: &[rk(1)],
     };
@@ -224,7 +222,6 @@ fn leases_protect_future_arrivals_and_do_not_extend() {
     let db = open(dir.path());
     let s = db.runtime_store(limits()).unwrap();
     let lease = RuntimeLease {
-        metadata: &[],
         id: [1; 32],
         keys: &[rk(1)],
     };
@@ -241,7 +238,6 @@ fn leases_protect_future_arrivals_and_do_not_extend() {
         RuntimeBatch {
             objects: &[object(rk(1))],
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [1; 32],
                 keys: &[rk(1)],
             }],
@@ -512,7 +508,6 @@ fn owned_snapshot_head_binding_replacement_metadata_and_gc_keep() {
             leases: &[RuntimeLease {
                 id: [1; 32],
                 keys: &[extra],
-                metadata: b"anchor",
             }],
             ..Default::default()
         },
@@ -543,7 +538,6 @@ fn owned_snapshot_head_binding_replacement_metadata_and_gc_keep() {
         vec![([10; 32], b"second".to_vec())]
     );
     assert_eq!(cloned.head_keys([10; 32]).unwrap(), Some(vec![k]));
-    assert_eq!(current.leases(10).unwrap()[0].3, b"anchor");
     assert_eq!(current.objects(1, 1).unwrap().len(), 1);
     drop(current);
     s.apply(
@@ -678,7 +672,6 @@ fn released_work_variant_can_be_resealed_after_bounded_reclaim() {
         3,
         RuntimeBatch {
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [1; 32],
                 keys: &[w],
             }],
@@ -734,7 +727,6 @@ fn incremental_lease_union_preserves_deadline_and_atomic_quota() {
         0,
         RuntimeBatch {
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [1; 32],
                 keys: &[rk(1)],
             }],
@@ -746,7 +738,6 @@ fn incremental_lease_union_preserves_deadline_and_atomic_quota() {
         100,
         RuntimeBatch {
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [1; 32],
                 keys: &[rk(2)],
             }],
@@ -762,7 +753,6 @@ fn incremental_lease_union_preserves_deadline_and_atomic_quota() {
         200,
         RuntimeBatch {
             leases: &[RuntimeLease {
-                metadata: &[],
                 id: [2; 32],
                 keys: &[rk(1)],
             }],
@@ -776,7 +766,6 @@ fn incremental_lease_union_preserves_deadline_and_atomic_quota() {
             RuntimeBatch {
                 objects: &[object(rk(3))],
                 leases: &[RuntimeLease {
-                    metadata: &[],
                     id: [1; 32],
                     keys: &[rk(3)]
                 }],
@@ -891,7 +880,6 @@ fn two_handles_serialize_lease_and_collection() {
             10,
             RuntimeBatch {
                 leases: &[RuntimeLease {
-                    metadata: &[],
                     id: [1; 32],
                     keys: &[rk(1)],
                 }],

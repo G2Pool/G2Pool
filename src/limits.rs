@@ -79,13 +79,11 @@ pub struct Budget {
     limits: Limits,
     deadline: Instant,
     cancel: Arc<AtomicBool>,
-    remaining: Duration,
     pub cost: Cost,
 }
 impl Budget {
     pub fn new(limits: Limits, cancel: Arc<AtomicBool>) -> Self {
         Self {
-            remaining: limits.duration,
             deadline: Instant::now()
                 .checked_add(limits.duration)
                 .unwrap_or_else(Instant::now),
@@ -96,11 +94,8 @@ impl Budget {
     }
     pub(crate) fn resume(&mut self) {
         self.deadline = Instant::now()
-            .checked_add(self.remaining)
+            .checked_add(self.limits.duration)
             .unwrap_or_else(Instant::now);
-    }
-    pub(crate) fn suspend(&mut self) {
-        self.remaining = self.deadline.saturating_duration_since(Instant::now());
     }
     pub fn check(&self) -> Result<()> {
         if self.cancel.load(Ordering::Acquire) {

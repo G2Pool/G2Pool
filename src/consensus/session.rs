@@ -12,8 +12,6 @@ pub struct Session {
     protocol: Id,
     cursor: Option<Id>,
     previous: u64,
-    started: bool,
-    primed: bool,
     ranked: bool,
     ledger: Ledger,
     reuse: Option<Ledger>,
@@ -24,22 +22,20 @@ pub struct Session {
     pending: std::collections::VecDeque<Id>,
     facts: Facts,
     required: BTreeSet<Key>,
-    closure: BTreeSet<Id>,
     budget: Option<Budget>,
     acquired: BTreeSet<Key>,
     required_traces: BTreeMap<usize, Arc<Trace>>,
+    history: BTreeMap<Id, (usize, usize)>,
 }
 impl Session {
     pub fn new(tip: Id, anchor: Anchor, protocol: Id) -> Self {
         Self {
             tip,
             previous: anchor.height,
-            ledger: Ledger::new(anchor.height, 0),
+            ledger: Ledger::new(anchor.height),
             anchor,
             protocol,
             cursor: Some(tip),
-            started: false,
-            primed: false,
             ranked: false,
             reuse: None,
             reuse_index: None,
@@ -49,10 +45,10 @@ impl Session {
             pending: std::collections::VecDeque::new(),
             facts: Facts::default(),
             required: BTreeSet::new(),
-            closure: BTreeSet::new(),
             budget: None,
             acquired: BTreeSet::new(),
             required_traces: BTreeMap::new(),
+            history: BTreeMap::new(),
         }
     }
     pub(crate) fn seed(&mut self, facts: &Facts) {
@@ -66,6 +62,48 @@ impl Session {
             self.incremental = self.reuse.is_some();
         }
     }
+    pub(crate) fn rebase(&mut self, view: &View<'_>) -> Result<()> {
+        if self.anchor == view.head {
+            return Ok(());
+        }
+        let extension = self.anchor.height <= view.head.height && view.anchor(&self.anchor).is_ok();
+        if extension {
+            self.ledger.rebase(view.head.height)?;
+            if let Some(reuse) = &mut self.reuse {
+                reuse.rebase(view.head.height)?;
+            }
+            if self.ranked {
+                self.full = self.ledger.full(view.profile.finance_low(view.head.height));
+                self.pending.retain(|id| self.full.contains(id));
+            }
+        } else {
+            let loaded = std::mem::take(&mut self.facts.loaded);
+            let leaves = std::mem::take(&mut self.facts.leaves);
+            let payload_bytes = self.facts.payload_bytes;
+            self.facts = Facts {
+                loaded,
+                leaves,
+                payload_bytes,
+                ..Facts::default()
+            };
+            self.cursor = Some(self.tip);
+            self.previous = view.head.height;
+            self.ranked = false;
+            self.ledger = Ledger::new(view.head.height);
+            self.reuse = None;
+            self.reuse_index = None;
+            self.incremental = false;
+            self.full.clear();
+            self.primary.clear();
+            self.pending.clear();
+            self.required.clear();
+            self.required_traces.clear();
+            self.history.clear();
+        }
+        view.check()?;
+        self.anchor = view.head.clone();
+        Ok(())
+    }
     pub(crate) fn facts(&self) -> Facts {
         self.facts.clone()
     }
@@ -77,11 +115,12 @@ impl Session {
             .bytes()
             .saturating_add(self.ledger.bytes())
             .saturating_add(self.reuse.as_ref().map_or(0, Ledger::bytes))
-            .saturating_add(self.required_traces.len() * 128 + self.acquired.len() * 128)
             .saturating_add(
-                (self.full.len() + self.pending.len() + self.closure.len()) * 96
-                    + self.required.len() * 128,
+                self.required_traces.len() * 128
+                    + self.history.len() * 128
+                    + self.acquired.len() * 128,
             )
+            .saturating_add((self.full.len() + self.pending.len()) * 96 + self.required.len() * 128)
     }
     pub(crate) fn witness_count(required: &BTreeSet<Key>) -> usize {
         required
@@ -119,9 +158,10 @@ impl Session {
         cancel: Arc<AtomicBool>,
         quantum: usize,
     ) -> Result<EvaluationProgress> {
-        if view.head != self.anchor || view.profile.protocol != self.protocol {
+        if view.profile.protocol != self.protocol {
             return Err(Error::View);
         }
+        self.rebase(view)?;
         let ceiling = limits.bytes;
         let budget = self
             .budget
@@ -132,22 +172,21 @@ impl Session {
             view,
             budget,
             required: std::mem::take(&mut self.required),
-            closure: std::mem::take(&mut self.closure),
             facts: std::mem::take(&mut self.facts),
             reuse_plans: self.incremental,
             traces: vec![],
             acquired: BTreeSet::new(),
             required_traces: std::mem::take(&mut self.required_traces),
+            history: std::mem::take(&mut self.history),
         };
         validator.budget.resume();
         let outcome = self.advance(&mut validator, quantum.max(1));
-        validator.budget.suspend();
         self.budget = Some(validator.budget);
         self.required = validator.required;
-        self.closure = validator.closure;
         self.facts = validator.facts;
         self.acquired.extend(validator.acquired);
         self.required_traces = validator.required_traces;
+        self.history = validator.history;
         if self.bytes() > ceiling {
             return Err(Error::Capacity("evaluation cache"));
         }
@@ -155,12 +194,13 @@ impl Session {
             Ok(Some(result)) => Ok(EvaluationProgress::Ready(Box::new(result))),
             Ok(None) => Ok(EvaluationProgress::Pending),
             Err(Error::Unavailable(key)) => Ok(EvaluationProgress::Missing(key)),
+            Err(Error::Capacity("evaluation time")) => Ok(EvaluationProgress::Pending),
             Err(error) => Err(error),
         }
     }
-    fn finish_ranking(&mut self, limit: usize) {
+    fn finish_ranking(&mut self, low: u64) {
         self.ranked = true;
-        self.full = self.ledger.validation(limit);
+        self.full = self.ledger.full(low);
         self.primary = self.ledger.primary();
         self.pending = self.full.iter().copied().collect();
     }
@@ -170,43 +210,38 @@ impl Session {
         quantum: usize,
     ) -> Result<Option<Evaluation>> {
         v.view.check()?;
+        let tip = v.work(self.tip)?;
+        if tip.job().anchor.height < v.view.profile.finance_low(self.anchor.height) {
+            return Err(Error::Expired);
+        }
         for _ in 0..quantum {
             v.traces.clear();
             v.budget.check()?;
             v.budget
                 .retained(v.retained_bytes().saturating_add(self.bytes()))?;
-            if !self.primed {
-                let root = v.work(self.tip)?;
-                if root.job().anchor.height < v.view.profile.finance_low(self.anchor.height) {
-                    return Err(Error::Expired);
-                }
-                self.primed = true;
-                continue;
-            }
             if !self.ranked {
                 let Some(id) = self.cursor else {
-                    self.finish_ranking(v.view.profile.validation_limit());
+                    self.finish_ranking(v.view.profile.finance_low(self.anchor.height));
                     continue;
                 };
                 let core = v.work(id)?;
                 let height = core.job().anchor.height;
-                if !self.started && height < v.view.profile.finance_low(self.anchor.height) {
-                    return Err(Error::Expired);
-                }
                 if self.ledger.contains(&id) || height > self.previous {
                     return Err(Error::Invalid("spine cycle/regression"));
                 }
-                let low = v.view.profile.finance_low(self.anchor.height);
-                if height < low {
+                if self.ledger.frames.len() == v.view.profile.work_window_limit() {
                     self.ledger.boundary = Some(id);
-                    self.finish_ranking(v.view.profile.validation_limit());
+                    self.finish_ranking(v.view.profile.finance_low(self.anchor.height));
                     continue;
                 }
                 if let Some(reuse) = &mut self.reuse {
                     if self.reuse_index.is_none() {
-                        reuse.advance(self.anchor.height, low)?;
+                        reuse.rebase(self.anchor.height)?;
                         if reuse.contains(&id) {
                             reuse.rewind_to(id);
+                            reuse.trim(
+                                v.view.profile.work_window_limit() - self.ledger.frames.len(),
+                            );
                             self.reuse_index = Some(0);
                         }
                     }
@@ -224,18 +259,29 @@ impl Session {
                         for frame in self.ledger.frames.iter().rev() {
                             joined.prepend(frame.clone())?;
                         }
+                        self.cursor = joined.boundary;
+                        self.previous = joined
+                            .frames
+                            .back()
+                            .map_or(self.anchor.height, |frame| frame.height());
                         self.ledger = joined;
-                        self.finish_ranking(v.view.profile.validation_limit());
+                        if self.ledger.frames.len() == v.view.profile.work_window_limit()
+                            || self.cursor.is_none()
+                        {
+                            self.finish_ranking(v.view.profile.finance_low(self.anchor.height));
+                        } else {
+                            self.ledger.boundary = None;
+                            self.reuse_index = None;
+                        }
                         continue;
                     }
                 }
-                self.ledger.advance(self.anchor.height, low)?;
+                self.ledger.rebase(self.anchor.height)?;
                 let frame = v.frame(core)?;
                 let parent = frame.parent;
                 self.ledger.append(frame)?;
                 v.budget.cost.topology_frames += 1;
                 self.previous = height;
-                self.started = true;
                 self.cursor = parent;
                 continue;
             }
@@ -268,11 +314,9 @@ impl Session {
             return Ok(Some(Evaluation {
                 tip: self.tip,
                 anchor: self.anchor.clone(),
-                score: self.ledger.score,
                 financial,
                 full: self.full.clone(),
                 primary: self.primary.clone(),
-                closure: v.closure.clone(),
                 required: v.required.clone(),
                 cost: v.budget.cost,
             }));
