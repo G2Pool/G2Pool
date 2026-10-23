@@ -1,30 +1,23 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[doc(hidden)]
-pub mod daemon;
+mod daemon;
 
 pub mod cli;
-pub mod codec;
-pub mod consensus;
-pub mod control;
-pub mod limits;
-#[doc(hidden)]
-pub mod mining;
-pub mod native;
-#[doc(hidden)]
-pub mod network;
-#[doc(hidden)]
-pub mod node;
-pub mod objects;
-pub mod pool;
+mod codec;
+mod consensus;
+mod control;
+mod limits;
+mod mining;
+mod native;
+mod network;
+mod node;
+mod objects;
+mod pool;
 
-pub mod secure_file;
-#[doc(hidden)]
-pub mod status;
-#[doc(hidden)]
-pub mod storage;
-#[doc(hidden)]
-pub mod wallet;
+mod secure_file;
+mod status;
+mod storage;
+mod wallet;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIN_PEER_VERSION: &str = "0.1.0";
@@ -49,6 +42,8 @@ pub enum Error {
     Expired,
     #[error("local resource limit: {0}")]
     Capacity(&'static str),
+    #[error("local resource limit: evaluation time")]
+    EvaluationTime,
     #[error("evaluation cancelled")]
     Cancelled,
     #[error("storage: {0}")]

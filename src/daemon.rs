@@ -36,34 +36,8 @@ pub struct Config {
     pub storage: StorageLimits,
     pub jobs: stratum::Retention,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct Instance {
-    network: ChainTypes,
-    stratum: SocketAddr,
-    peer: SocketAddr,
-    grin_host: IpAddr,
-    grin_port: u16,
-}
-impl Instance {
-    pub fn from_config(c: &Config) -> Self {
-        Self {
-            network: c.network,
-            stratum: c.stratum,
-            peer: c.peer,
-            grin_host: c.grin_host,
-            grin_port: c.grin_port,
-        }
-    }
-}
 fn default_grin_host() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-}
-fn read_config(path: &std::path::Path) -> Result<Vec<u8>> {
-    crate::secure_file::read_regular(path, 16384, false)
-        .map_err(|e| Error::NativeUnavailable(format!("configuration {}: {e}", path.display())))
-}
-pub fn publish_config(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    crate::secure_file::publish_atomic(path, bytes, true)
 }
 pub fn private_api_secret(path: &std::path::Path) -> Result<String> {
     let secret = hex(&rand::random::<[u8; 32]>());
@@ -81,32 +55,16 @@ impl Config {
     ) -> Result<Self> {
         let testnet = network == ChainTypes::Testnet;
         let data = crate::network_data_dir(base, if testnet { "testnet" } else { "mainnet" });
-        let instance_path = data.join("instance.json");
-        let saved: Option<Instance> = match fs::symlink_metadata(&instance_path) {
-            Ok(_) => Some(serde_json::from_slice(&read_config(&instance_path)?)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        if saved.as_ref().is_some_and(|saved| saved.network != network) {
-            return Err(Error::Invalid("network differs from this data directory"));
-        }
         let config = Self {
             data,
             network,
             pool_file,
             stratum: stratum
-                .or_else(|| saved.as_ref().map(|s| s.stratum))
                 .unwrap_or_else(|| ([127, 0, 0, 1], if testnet { 13420 } else { 3420 }).into()),
-            peer: peer
-                .or_else(|| saved.as_ref().map(|s| s.peer))
-                .unwrap_or_else(|| ([0, 0, 0, 0], if testnet { 13417 } else { 3417 }).into()),
-            grin_host: grin
-                .map(|a| a.ip())
-                .or_else(|| saved.as_ref().map(|s| s.grin_host))
-                .unwrap_or_else(default_grin_host),
+            peer: peer.unwrap_or_else(|| ([0, 0, 0, 0], if testnet { 13417 } else { 3417 }).into()),
+            grin_host: grin.map(|a| a.ip()).unwrap_or_else(default_grin_host),
             grin_port: grin
                 .map(|a| a.port())
-                .or_else(|| saved.as_ref().map(|s| s.grin_port))
                 .unwrap_or(if testnet { 13418 } else { 3418 }),
             evaluation: Limits::default(),
             storage: StorageLimits::default(),
@@ -127,31 +85,10 @@ impl Config {
     }
 }
 pub fn open_node_lock(data: &std::path::Path) -> Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    Ok(options.open(data.join("node.lock"))?)
+    crate::secure_file::open_lock(&data.join("node.lock"))
 }
 fn validate_node_lock(data: &std::path::Path, process_lock: &fs::File) -> Result<()> {
-    let opened = process_lock.metadata()?;
-    let named = fs::symlink_metadata(data.join("node.lock"))?;
-    if !opened.is_file() || !named.is_file() {
-        return Err(Error::Invalid("node lock must be a regular file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if opened.dev() != named.dev() || opened.ino() != named.ino() {
-            return Err(Error::Invalid("node lock changed during startup"));
-        }
-    }
-    Ok(())
+    crate::secure_file::validate_lock(&data.join("node.lock"), process_lock)
 }
 fn initialize_wallet<C: grin_wallet_libwallet::NodeClient + 'static>(
     data: &std::path::Path,
@@ -302,11 +239,18 @@ pub fn run(config: Config) -> Result<()> {
     if !wallet_existed {
         println!("Created G2Pool wallet.");
     }
-    publish_config(
-        &config.data.join("instance.json"),
-        &serde_json::to_vec_pretty(&Instance::from_config(&config))?,
+    let mut node = Node::start(
+        chain.clone(),
+        profile,
+        store,
+        config.evaluation.clone(),
+        runtime
+            .server
+            .as_ref()
+            .ok_or(Error::Invalid("native server stopped"))?
+            .sync_state
+            .clone(),
     )?;
-    let mut node = Node::start(chain.clone(), profile, store, config.evaluation.clone())?;
     node.cancel = stop.clone();
     node.peers = crate::network::peers::Book::open_store(
         &node.store,
@@ -315,7 +259,6 @@ pub fn run(config: Config) -> Result<()> {
         &bootstrap_peers,
     )?;
     node.listening_port = config.peer.port();
-    node.ensure_view()?;
     println!(
         "pool={} pool-id={} account={}",
         pool.name,
@@ -349,9 +292,14 @@ pub fn run(config: Config) -> Result<()> {
     .map_err(|error| Error::NativeUnavailable(format!("wallet service: {error}")))?;
     runtime.workers.push(payment_thread);
 
+    let status = {
+        let guard = node.lock().map_err(|_| Error::Invalid("node poisoned"))?;
+        crate::status::runtime::Status::new(&guard, pool.name.clone(), config.data.clone())
+    };
+
     let control_listener = crate::control::Listener::bind(&config.data)?;
     let control_service = Arc::new(crate::control::Service::new(
-        config.data.clone(),
+        status.clone(),
         payment_worker.clone(),
     ));
     let control_stop = stop.clone();
@@ -372,21 +320,6 @@ pub fn run(config: Config) -> Result<()> {
         pool.key(),
     )?;
     runtime.workers.push(peer_thread);
-    let monitor = {
-        let guard = node.lock().map_err(|_| Error::Invalid("node poisoned"))?;
-        crate::status::runtime::Monitor::new(
-            &guard,
-            pool.name.clone(),
-            config.data.clone(),
-            runtime.server.as_ref().map(|s| s.sync_state.clone()),
-        )
-    };
-    let monitor_stop = stop.clone();
-    let monitor_thread = thread::spawn(move || {
-        monitor.run(monitor_stop);
-        Ok(())
-    });
-    runtime.workers.push(monitor_thread);
     let mine_service = mining.clone();
     let miner_stop = stop.clone();
     let miner_thread =
@@ -418,6 +351,7 @@ pub fn run(config: Config) -> Result<()> {
                 Ok(()) => solution_error = None,
                 Err(
                     error @ (Error::Capacity(_)
+                    | Error::EvaluationTime
                     | Error::Unavailable(_)
                     | Error::NativeUnavailable(_)
                     | Error::View
@@ -453,6 +387,7 @@ pub fn run(config: Config) -> Result<()> {
                 Err(Error::View) => {}
                 Err(
                     error @ (Error::Capacity(_)
+                    | Error::EvaluationTime
                     | Error::Unavailable(_)
                     | Error::NativeUnavailable(_)),
                 ) => {
@@ -477,7 +412,8 @@ pub fn run(config: Config) -> Result<()> {
             } else {
                 "ready"
             };
-            let overlay = crate::status::runtime::read(&config.data)
+            let overlay = status
+                .snapshot()
                 .map(|s| format!("pool {}; {} peers", s.state, s.connected_peers))
                 .unwrap_or_else(|_| "pool status pending".into());
             println!("{overlay}");
@@ -517,6 +453,33 @@ pub fn run(config: Config) -> Result<()> {
                 }
             }
             last_status = Instant::now();
+        }
+        if last_gc.elapsed() > Duration::from_secs(60) {
+            let prepared = node
+                .lock()
+                .map_err(|_| Error::Invalid("node poisoned"))?
+                .prepare_maintenance();
+            let compaction = prepared.and_then(crate::node::Maintenance::run);
+            let pins = mining.pins()?;
+            let result = node
+                .lock()
+                .map_err(|_| Error::Invalid("node poisoned"))?
+                .finish_maintenance(
+                    compaction,
+                    chrono::Utc::now().timestamp()
+                        - crate::storage::sharechain::ACQUISITION_LIFETIME as i64,
+                    &pins,
+                );
+            match result {
+                Ok(_) | Err(Error::View) => {}
+                Err(Error::NativeUnavailable(_))
+                    if runtime
+                        .server
+                        .as_ref()
+                        .is_some_and(|native| native.sync_state.is_syncing()) => {}
+                Err(error) => eprintln!("storage maintenance retryable: {error}"),
+            }
+            last_gc = Instant::now();
         }
         if runtime
             .server
@@ -565,34 +528,6 @@ pub fn run(config: Config) -> Result<()> {
                     thread::sleep(Duration::from_secs(1));
                 }
             }
-        }
-        if last_gc.elapsed() > Duration::from_secs(60) {
-            let prepared = {
-                node.lock()
-                    .map_err(|_| Error::Invalid("node poisoned"))?
-                    .prepare_maintenance()
-            };
-            let result = match prepared {
-                Ok(plan) => match plan.run() {
-                    Ok(plan) => {
-                        let pins = mining.pins()?;
-                        node.lock()
-                            .map_err(|_| Error::Invalid("node poisoned"))?
-                            .finish_maintenance(
-                                plan,
-                                chrono::Utc::now().timestamp()
-                                    - crate::storage::sharechain::ACQUISITION_LIFETIME as i64,
-                                &pins,
-                            )
-                    }
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                eprintln!("collection retryable: {error}");
-            }
-            last_gc = Instant::now();
         }
         thread::sleep(Duration::from_millis(100));
     }

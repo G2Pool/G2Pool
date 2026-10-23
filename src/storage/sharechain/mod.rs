@@ -119,6 +119,9 @@ impl SharechainDb {
     pub(crate) fn used_bytes(&self) -> Result<u64> {
         self.budget.used(&self.env.read_txn()?)
     }
+    pub(crate) fn allocated_bytes(&self) -> Result<u64> {
+        Ok(self.env.real_disk_size()?)
+    }
     pub(crate) fn byte_limit(&self) -> u64 {
         self.budget.limit
     }

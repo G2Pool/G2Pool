@@ -914,12 +914,6 @@ fn handle_rpc(
                         Ok((source, work, serving, ticket, kind)) => {
                             let completed = completed.clone();
                             tokio::task::spawn_blocking(move || {
-                                let kind = match kind {
-                                    0 => grin_core::global::ChainTypes::Mainnet,
-                                    1 => grin_core::global::ChainTypes::Testnet,
-                                    2 => grin_core::global::ChainTypes::AutomatedTesting,
-                                    _ => grin_core::global::ChainTypes::UserTesting,
-                                };
                                 grin_core::global::set_local_chain_type(kind);
                                 let _work = work;
                                 let _serving = serving;
@@ -972,7 +966,7 @@ fn handle_rpc(
                                         .map(|(addr, _)| *addr)
                                     {
                                         let address = SocketAddr::new(addr.ip(), port);
-                                        node.peers.learn_from(address, addr)?;
+                                        node.peers.learn_from(address, addr);
                                     }
                                 }
                                 Message::Addresses(vec![])

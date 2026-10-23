@@ -9,16 +9,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
-pub const VERSION: u16 = 1;
 pub const SOCKET_FILE: &str = "g2pool.control";
 const MAX_FRAME: usize = 6 * crate::wallet::payments::MAX_SLATEPACK_BYTES + 1024;
 const MAX_CONNECTIONS: usize = 64;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
-    pub version: u16,
-    pub id: u64,
     pub token: String,
     pub command: Command,
 }
@@ -33,8 +31,6 @@ pub enum Command {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
-    pub version: u16,
-    pub id: u64,
     pub result: ResponseResult,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,18 +52,9 @@ pub struct Listener {
     listener: TcpListener,
     path: PathBuf,
     token: String,
-    _lock: fs::File,
 }
 impl Listener {
     pub fn bind(data: &Path) -> Result<Self> {
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(data.join("g2pool.control.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .map_err(|_| crate::Error::Capacity("control service already running"))?;
         let path = socket_path(data);
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
@@ -82,7 +69,6 @@ impl Listener {
             listener,
             path,
             token,
-            _lock: lock,
         })
     }
     fn accept(&self) -> std::io::Result<TcpStream> {
@@ -104,10 +90,13 @@ fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
     stream.flush()?;
     Ok(())
 }
-fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+fn read_frame(reader: &mut impl BufRead, deadline: Option<Instant>) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     loop {
         let buffer = reader.fill_buf()?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+        }
         if buffer.is_empty() {
             break;
         }
@@ -132,27 +121,12 @@ pub fn serve_one(
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let line = read_frame(&mut reader)?;
+    let line = read_frame(&mut reader, Some(Instant::now() + Duration::from_secs(5)))?;
     let request: Request = serde_json::from_slice(&line)?;
-    if request.version != VERSION {
-        return write_response(
-            &mut stream,
-            Response {
-                version: VERSION,
-                id: request.id,
-                result: ResponseResult::Err {
-                    code: "version".into(),
-                    message: "unsupported control protocol version".into(),
-                },
-            },
-        );
-    }
     if request.token != token {
         return write_response(
             &mut stream,
             Response {
-                version: VERSION,
-                id: request.id,
                 result: ResponseResult::Err {
                     code: "auth".into(),
                     message: "invalid control token".into(),
@@ -226,18 +200,16 @@ fn read_endpoint(path: &Path) -> Result<Endpoint> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 pub fn call(data: &Path, command: Command) -> Result<Response> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let endpoint = read_endpoint(&socket_path(data))?;
     let mut stream = TcpStream::connect(&endpoint.address)?;
-    stream.set_read_timeout(if matches!(command, Command::Status) {
+    let timeout = if matches!(command, Command::Status) {
         Some(std::time::Duration::from_secs(5))
     } else {
         None
-    })?;
+    };
+    stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
     let request = Request {
-        version: VERSION,
-        id: NEXT.fetch_add(1, Ordering::Relaxed),
         token: endpoint.token,
         command,
     };
@@ -248,26 +220,29 @@ pub fn call(data: &Path, command: Command) -> Result<Response> {
     stream.write_all(&bytes)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    let line = read_frame(&mut BufReader::new(stream))?;
+    let line = read_frame(
+        &mut BufReader::new(stream),
+        timeout.map(|timeout| Instant::now() + timeout),
+    )?;
     let response: Response = serde_json::from_slice(&line)?;
-    if response.version != VERSION || response.id != request.id {
-        return Err(crate::Error::Invalid("control response identity"));
-    }
     Ok(response)
 }
 
 pub struct Service {
-    data: PathBuf,
+    status: crate::status::runtime::Status,
     payments: Arc<crate::wallet::payments::PaymentWorker>,
 }
 impl Service {
-    pub fn new(data: PathBuf, payments: Arc<crate::wallet::payments::PaymentWorker>) -> Self {
-        Self { data, payments }
+    pub fn new(
+        status: crate::status::runtime::Status,
+        payments: Arc<crate::wallet::payments::PaymentWorker>,
+    ) -> Self {
+        Self { status, payments }
     }
     pub fn handle(&self, request: Request) -> Response {
         let result = match request.command {
             Command::Status => {
-                let node = crate::status::runtime::read(&self.data);
+                let node = self.status.snapshot();
                 let wallet = self.payments.snapshot();
                 match (node, wallet) {
                     (Ok(node), Ok(wallet)) => ResponseResult::Ok {
@@ -294,11 +269,7 @@ impl Service {
                 }
             }
         };
-        Response {
-            version: VERSION,
-            id: request.id,
-            result,
-        }
+        Response { result }
     }
     fn error(code: &str, error: impl std::fmt::Display) -> ResponseResult {
         ResponseResult::Err {

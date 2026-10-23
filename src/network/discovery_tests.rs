@@ -53,7 +53,7 @@ fn retained_connection_refreshes_its_peer_list_without_reconnecting() {
     {
         let mut right = right.lock().unwrap();
         right.peers.seed(first).unwrap();
-        right.peers.outcome(first, true, now).unwrap();
+        right.peers.outcome(first, true, now);
     }
     let mut client = Client::new(right_address, pool_id);
     client.synchronize_turns(&left, &stop, 0).unwrap();
@@ -69,7 +69,7 @@ fn retained_connection_refreshes_its_peer_list_without_reconnecting() {
     {
         let mut right = right.lock().unwrap();
         right.peers.seed(later).unwrap();
-        right.peers.outcome(later, true, now).unwrap();
+        right.peers.outcome(later, true, now);
     }
     client
         .refresh_peers(&left, &stop, due - Duration::from_nanos(1))

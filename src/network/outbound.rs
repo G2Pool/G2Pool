@@ -171,7 +171,10 @@ impl Connections {
                 }
                 if inbound.is_none()
                     && !announced
-                    && matches!(result, Ok(_) | Err(Error::Capacity(_)))
+                    && matches!(
+                        result,
+                        Ok(_) | Err(Error::Capacity(_) | Error::EvaluationTime)
+                    )
                 {
                     if let Ok(Some(connection)) = client.verified_connection(&node) {
                         if ready.try_send((address, connection)).is_err() {
@@ -187,10 +190,10 @@ impl Connections {
                             node.peers.reached(address, now);
                         }
                         if result.as_ref().is_ok_and(|count| *count > 0) {
-                            let _ = node.peers.outcome(address, true, now);
+                            node.peers.outcome(address, true, now);
                             node.peers.progress(address, now);
                         } else if result.is_err() {
-                            let _ = node.peers.outcome(address, false, now);
+                            node.peers.outcome(address, false, now);
                         }
                     }
                 }
@@ -241,6 +244,7 @@ fn retryable(error: &Error) -> bool {
     matches!(
         error,
         Error::Capacity(_)
+            | Error::EvaluationTime
             | Error::View
             | Error::Future
             | Error::Unavailable(_)

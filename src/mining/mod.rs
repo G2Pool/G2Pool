@@ -143,15 +143,7 @@ impl Preparation {
         {
             return Err(Error::Invalid("template coinbase transaction"));
         }
-        let fees = transaction.kernels().iter().try_fold(0u64, |sum, k| {
-            sum.checked_add(match k.features {
-                KernelFeatures::Plain { fee }
-                | KernelFeatures::HeightLocked { fee, .. }
-                | KernelFeatures::NoRecentDuplicate { fee, .. } => fee.fee(),
-                KernelFeatures::Coinbase => 0,
-            })
-            .ok_or(Error::Invalid("template fee sum"))
-        })?;
+        let fees = transaction.fee();
         let mut validator =
             Validator::bounded(&store, &view, self.limits.clone(), self.cancel.clone());
         if let Some(facts) = self.facts.as_ref() {

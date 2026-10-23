@@ -13,6 +13,12 @@ use grin_core::{
 };
 use grin_keychain::{ExtKeychain, ExtKeychainPath, Keychain};
 
+pub(crate) fn synchronized() -> Arc<grin_chain::SyncState> {
+    let state = Arc::new(grin_chain::SyncState::new());
+    state.reset();
+    state
+}
+
 pub(crate) fn setup() -> (
     Node,
     Signer,
@@ -54,7 +60,7 @@ pub(crate) fn setup() -> (
     .unwrap();
     store.bind_wallet(wallet.account()).unwrap();
     (
-        Node::start(chain, profile, store, Limits::default()).unwrap(),
+        Node::start(chain, profile, store, Limits::default(), synchronized()).unwrap(),
         wallet,
         payments,
         dir,
@@ -260,7 +266,7 @@ fn reorg_retires_invalid_root_after_restart_and_allows_new_work() {
     let path = node.store.path().to_owned();
     drop(node);
     let store = Store::open(&path, profile.pool_id, StorageLimits::default()).unwrap();
-    let mut node = Node::start(chain, profile, store, Limits::default()).unwrap();
+    let mut node = Node::start(chain, profile, store, Limits::default(), synchronized()).unwrap();
     recover(&mut node);
     assert!(node.store.heads().unwrap().is_empty());
     assert!(matches!(node.parent().unwrap(), Parent::Root(_)));
@@ -382,7 +388,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
     )
     .unwrap();
     store.bind_wallet(signer.account()).unwrap();
-    let mut source = Node::start(chain, profile, store, Limits::default()).unwrap();
+    let mut source = Node::start(chain, profile, store, Limits::default(), synchronized()).unwrap();
     let mut origin = None;
     let mut tip = [0; 32];
     let shares = 4 * (source.profile.work_window_limit() + usize::from(source.profile.uncle_depth));
@@ -410,6 +416,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
         source.profile.clone(),
         store,
         Limits::default(),
+        synchronized(),
     )
     .unwrap();
     let mut advanced = false;
@@ -489,6 +496,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
         source.profile.clone(),
         store,
         Limits::default(),
+        synchronized(),
     )
     .unwrap();
     recover(&mut target);
@@ -611,6 +619,7 @@ fn short_branches_preserve_incumbent_across_refresh_and_restart_and_enforce_fres
             left.profile.clone(),
             store,
             Limits::default(),
+            synchronized(),
         )
         .unwrap()
     };
@@ -656,6 +665,7 @@ fn short_branches_preserve_incumbent_across_refresh_and_restart_and_enforce_fres
         left.profile.clone(),
         store,
         Limits::default(),
+        synchronized(),
     )
     .unwrap();
     recover(&mut target);
@@ -728,6 +738,7 @@ fn disconnected_branches_compare_recent_work_with_native_freshness() {
             profile.clone(),
             store,
             Limits::default(),
+            synchronized(),
         )
         .unwrap();
         let mut tip = [0; 32];
@@ -806,7 +817,14 @@ fn slow_rolling_window_matches_cold_recovery_and_reorg() {
     };
     let mut store = Store::open(&path, profile.pool_id, limits.clone()).unwrap();
     store.bind_wallet(signer.account()).unwrap();
-    let mut node = Node::start(chain.clone(), profile.clone(), store, Limits::default()).unwrap();
+    let mut node = Node::start(
+        chain.clone(),
+        profile.clone(),
+        store,
+        Limits::default(),
+        synchronized(),
+    )
+    .unwrap();
     let mut tip = [0; 32];
     let mut shares = Vec::new();
     for round in 0..5 {
@@ -825,10 +843,14 @@ fn slow_rolling_window_matches_cold_recovery_and_reorg() {
         assert_eq!(node.parent().unwrap(), Parent::Receipt(tip));
     }
     assert_eq!(chain.head_header().unwrap().height, 24);
-    let (warm, facts) = node.evaluate_cached(tip).unwrap();
-    assert_eq!(warm.full, [shares[3], shares[4]].into_iter().collect());
+    let (evaluation, warm) = node.evaluate_cached(tip).unwrap();
+    let full = warm
+        .branch()
+        .unwrap()
+        .full(node.profile.finance_low(evaluation.anchor.height));
+    assert_eq!(full, [shares[3], shares[4]].into_iter().collect());
     let low = profile.work_low(chain.head_header().unwrap().height);
-    let expected_score = facts
+    let expected_score = warm
         .branch()
         .unwrap()
         .window_score(profile.work_window_limit(), low)
@@ -845,15 +867,24 @@ fn slow_rolling_window_matches_cold_recovery_and_reorg() {
     ));
     drop(node);
     let store = Store::open(&path, profile.pool_id, limits).unwrap();
-    let mut cold = Node::start(chain, profile, store, Limits::default()).unwrap();
+    let mut cold = Node::start(chain, profile, store, Limits::default(), synchronized()).unwrap();
     let result = cold.prepare_recovery().unwrap().unwrap().run();
     let result = cold.finish_recovery(result);
     assert!(result.is_ok());
     recover(&mut cold);
     assert_eq!(cold.parent().unwrap(), Parent::Receipt(tip));
-    let (checked, facts) = cold.evaluate_cached(tip).unwrap();
-    assert_eq!(checked.full, warm.full);
-    assert_eq!(checked.financial.record, warm.financial.record);
+    let (evaluation, facts) = cold.evaluate_cached(tip).unwrap();
+    assert_eq!(
+        facts
+            .branch()
+            .unwrap()
+            .full(cold.profile.finance_low(evaluation.anchor.height)),
+        full
+    );
+    assert_eq!(
+        facts.financial().unwrap().record,
+        warm.financial().unwrap().record
+    );
     assert_eq!(
         facts
             .branch()
@@ -884,6 +915,7 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
         source.profile.clone(),
         store,
         Limits::default(),
+        synchronized(),
     )
     .unwrap();
     let material: Vec<_> = [Kind::Core, Kind::Authorization]
@@ -993,6 +1025,7 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
         source.profile.clone(),
         store,
         Limits::default(),
+        synchronized(),
     )
     .unwrap();
     let turn = target.take_turn(tip).unwrap().unwrap();
@@ -1087,4 +1120,211 @@ fn mined_work_and_signed_wallet_statements_cannot_be_relabelled_for_another_pool
         id(&fields).unwrap(),
         &public
     ));
+}
+
+#[test]
+fn recovery_waits_for_native_sync_and_keeps_anchors_ahead_of_local_chain() {
+    let (mut source, signer, payments, _source_dir) = setup();
+    let block = native_block(&source, &source.chain.head_header().unwrap(), 654321);
+    source
+        .chain
+        .process_block(block.clone(), grin_chain::Options::MINE)
+        .unwrap();
+    let tip = share(&mut source, &signer, &payments).0;
+    let path = source.store.path().to_owned();
+    let profile = source.profile.clone();
+    drop(source);
+    let (behind, _keys, _wallet, _behind_dir) = setup();
+    assert_eq!(behind.profile.pool_id, profile.pool_id);
+    let sync = Arc::new(grin_chain::SyncState::new());
+    let store = Store::open(&path, profile.pool_id, StorageLimits::default()).unwrap();
+    let mut node = Node::start(
+        behind.chain.clone(),
+        profile,
+        store,
+        Limits::default(),
+        sync.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        node.prepare_recovery(),
+        Err(Error::NativeUnavailable(_))
+    ));
+    assert!(matches!(
+        node.take_turn(tip),
+        Err(Error::NativeUnavailable(_))
+    ));
+    assert!(matches!(
+        node.prepare_stage(vec![]),
+        Err(Error::NativeUnavailable(_))
+    ));
+    sync.reset();
+    let recovery = node.prepare_recovery().unwrap().unwrap().run();
+    assert!(matches!(
+        node.finish_recovery(recovery),
+        Err(Error::NativeUnavailable(_))
+    ));
+    assert!(node
+        .store
+        .heads()
+        .unwrap()
+        .iter()
+        .any(|head| head.tip == tip));
+    behind
+        .chain
+        .process_block(block, grin_chain::Options::MINE)
+        .unwrap();
+    let recovery = node.prepare_recovery().unwrap().unwrap().run();
+    sync.update(grin_chain::SyncStatus::Initial);
+    assert!(matches!(
+        node.finish_recovery(recovery),
+        Err(Error::NativeUnavailable(_))
+    ));
+    assert!(node
+        .store
+        .heads()
+        .unwrap()
+        .iter()
+        .any(|head| head.tip == tip));
+    sync.reset();
+    recover(&mut node);
+    assert_eq!(node.parent().unwrap(), Parent::Receipt(tip));
+    assert!(node.acquisition_heads().unwrap().is_empty());
+}
+
+#[test]
+fn interrupted_acquisitions_release_their_slots() {
+    let (mut node, _signer, _payments, _dir) = setup();
+    for n in 1..=8 {
+        let turn = node.take_turn([n; 32]).unwrap().unwrap();
+        node.native_sync.update(grin_chain::SyncStatus::Initial);
+        assert!(matches!(
+            node.finish_turn(turn, Ok(EvaluationProgress::Pending)),
+            Err(Error::NativeUnavailable(_))
+        ));
+        node.native_sync.reset();
+    }
+    assert!(node.tasks.is_empty());
+    assert_eq!(node.running.len(), 1);
+    assert_eq!(node.acquisition_heads().unwrap().len(), 1);
+    let tip = [9; 32];
+    let turn = node.take_turn(tip).unwrap().unwrap();
+    assert_eq!(node.acquisition_heads().unwrap(), vec![tip]);
+    assert!(matches!(
+        node.finish_turn(turn, Err(Error::Capacity("evaluation cache"))),
+        Err(Error::Capacity("evaluation cache"))
+    ));
+    assert!(node.running.is_empty());
+    assert!(node.acquisition_heads().unwrap().is_empty());
+}
+
+#[test]
+fn late_download_protection_cannot_restart_a_completed_acquisition() {
+    let (mut source, signer, payments, dir) = setup();
+    let tip = share(&mut source, &signer, &payments).0;
+    let store = Store::open(
+        &dir.path().join("late-download"),
+        source.profile.pool_id,
+        StorageLimits::default(),
+    )
+    .unwrap();
+    let mut target = Node::start(
+        source.chain.clone(),
+        source.profile.clone(),
+        store,
+        Limits::default(),
+        synchronized(),
+    )
+    .unwrap();
+    let turn = target.take_turn(tip).unwrap().unwrap();
+    target
+        .protect_download(tip, &[Key::new(Kind::Core, tip)])
+        .unwrap();
+    let (turn, outcome) = turn.run();
+    let missing = match target.finish_turn(turn, outcome).unwrap() {
+        EvaluationProgress::Missing(key) => key,
+        _ => panic!("expected missing share data"),
+    };
+    acquire(&source, &mut target, tip);
+    assert!(target.advertised_heads().unwrap().contains(&tip));
+    assert!(target.tasks.is_empty() && target.running.is_empty());
+    assert!(matches!(
+        target.protect_download(tip, &[missing]),
+        Err(Error::Cancelled)
+    ));
+    assert!(target.acquisition_heads().unwrap().is_empty());
+}
+
+#[test]
+fn collection_survives_compaction_failure_and_preserves_pins() {
+    let (mut node, _signer, _payments, _dir) = setup();
+    let objects: Vec<_> = (1..=4)
+        .map(|n| {
+            Object::content(&Inventory {
+                owner: [n; 33],
+                rows: List(vec![]),
+            })
+            .unwrap()
+        })
+        .collect();
+    node.store.stage(&objects[..3]).unwrap();
+    let pins = BTreeSet::from([objects[1].key]);
+    node.store
+        .acquire(
+            [9; 32],
+            &BTreeSet::from([objects[2].key]),
+            node.limits.facts,
+        )
+        .unwrap();
+    let maintenance = node.prepare_maintenance().unwrap().run();
+    let block = native_block(&node, &node.chain.head_header().unwrap(), 654322);
+    node.chain
+        .process_block(block, grin_chain::Options::MINE)
+        .unwrap();
+    assert!(matches!(
+        node.finish_maintenance(maintenance, chrono::Utc::now().timestamp() + 1, &pins),
+        Err(Error::View)
+    ));
+    assert!(matches!(
+        node.store.read(objects[0].key),
+        Err(Error::Unavailable(_))
+    ));
+    assert!(node.store.read(objects[1].key).is_ok());
+    assert!(node.store.read(objects[2].key).is_ok());
+
+    node.store.stage(&objects[3..]).unwrap();
+    let _first = node.peer_work.acquire().unwrap();
+    let _second = node.peer_work.acquire().unwrap();
+    let unavailable = node.prepare_maintenance();
+    assert!(matches!(unavailable, Err(Error::Capacity(_))));
+    assert!(matches!(
+        node.finish_maintenance(
+            unavailable.and_then(Maintenance::run),
+            chrono::Utc::now().timestamp() + 1,
+            &pins,
+        ),
+        Err(Error::Capacity(_))
+    ));
+    assert!(matches!(
+        node.store.read(objects[3].key),
+        Err(Error::Unavailable(_))
+    ));
+    node.store.stage(&objects[..1]).unwrap();
+    node.native_sync.update(grin_chain::SyncStatus::Initial);
+    let syncing = node.prepare_maintenance();
+    assert!(matches!(syncing, Err(Error::NativeUnavailable(_))));
+    assert!(matches!(
+        node.finish_maintenance(
+            syncing.and_then(Maintenance::run),
+            chrono::Utc::now().timestamp() + 1,
+            &pins,
+        ),
+        Err(Error::NativeUnavailable(_))
+    ));
+    assert!(matches!(
+        node.store.read(objects[0].key),
+        Err(Error::Unavailable(_))
+    ));
+    assert!(node.store.read(objects[1].key).is_ok());
+    assert!(node.store.read(objects[2].key).is_ok());
 }

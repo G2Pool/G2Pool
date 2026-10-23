@@ -113,21 +113,8 @@ fn winning_disconnected_head_replaces_only_the_incumbent_at_capacity() {
     let evaluation = |tip| Evaluation {
         tip,
         anchor: anchor.clone(),
-        financial: crate::consensus::Financial {
-            record: PayoutRecord {
-                anchor: anchor.clone(),
-                parent: Parent::Root(anchor.clone()),
-                receipts: List(vec![]),
-                accounts: List(vec![]),
-                paid: 0,
-                finder: 0,
-            },
-            coupons: vec![],
-        },
-        full: [tip].into_iter().collect(),
         primary: [tip].into_iter().collect(),
         required: [object.key].into_iter().collect(),
-        cost: Default::default(),
     };
     let expected = store.fence(&anchor).unwrap();
     let incumbent = [1; 32];
@@ -184,7 +171,6 @@ fn winning_disconnected_head_replaces_only_the_incumbent_at_capacity() {
     );
     assert_eq!(store.read(object.key).unwrap(), object.bytes);
 }
-
 
 impl Store {
     pub(crate) fn stage(&mut self, objects: &[Object]) -> Result<()> {

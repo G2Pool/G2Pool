@@ -2,8 +2,7 @@ mod acquisition;
 mod maintenance;
 mod staging;
 use acquisition::{Acquisition, Running};
-pub use acquisition::{Recovery, RecoveryResult};
-pub use maintenance::{Maintenance, MaintenanceResult};
+pub(crate) use maintenance::Maintenance;
 
 use crate::{
     codec::*,
@@ -34,6 +33,7 @@ pub struct Node {
     pub(crate) connected: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) published: Arc<std::sync::RwLock<Published>>,
     pub chain: Arc<Chain>,
+    pub(crate) native_sync: Arc<grin_chain::SyncState>,
     pub peers: crate::network::peers::Book,
     pub listening_port: u16,
     pub(crate) transport: Option<crate::network::transport::Handle>,
@@ -109,6 +109,7 @@ impl Node {
         profile: Profile,
         mut store: Store,
         limits: Limits,
+        native_sync: Arc<grin_chain::SyncState>,
     ) -> Result<Self> {
         if u64::from(grin_core::global::cut_through_horizon()) < 2 * profile.lifetime - 2 {
             return Err(Error::NativeUnavailable(
@@ -119,7 +120,11 @@ impl Node {
             return Err(Error::Invalid("node pool identity"));
         }
         store.attach_native(chain.clone(), profile.clone())?;
-        let peers = crate::network::peers::Book::memory(profile.network >= 2);
+        let peers = crate::network::peers::Book::memory(matches!(
+            profile.network,
+            grin_core::global::ChainTypes::AutomatedTesting
+                | grin_core::global::ChainTypes::UserTesting
+        ));
         let mut node = Self {
             connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             published: Arc::new(std::sync::RwLock::new(Published::default())),
@@ -130,6 +135,7 @@ impl Node {
                 crate::network::download::Downloads::default(),
             )),
             chain,
+            native_sync,
             profile,
             store,
             limits,
@@ -379,6 +385,11 @@ impl Node {
             .map(|(_, facts)| facts)
     }
     pub fn ensure_view(&mut self) -> Result<()> {
+        if self.native_sync.is_syncing() {
+            return Err(Error::NativeUnavailable(
+                "Grin node is synchronizing".into(),
+            ));
+        }
         let head = self.view()?.head;
         if self.revision()?.anchor != head {
             self.begin_refresh()?;

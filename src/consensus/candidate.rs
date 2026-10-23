@@ -25,15 +25,7 @@ impl<S: Source> Validator<'_, '_, S> {
             tx.validate(Weighting::AsBlock)
                 .map_err(|_| Error::Invalid("transaction validation"))?;
         }
-        let fees = tx.kernels().iter().try_fold(0u64, |sum, k| {
-            let fee = match k.features {
-                KernelFeatures::Plain { fee }
-                | KernelFeatures::HeightLocked { fee, .. }
-                | KernelFeatures::NoRecentDuplicate { fee, .. } => fee.fee(),
-                KernelFeatures::Coinbase => 0,
-            };
-            sum.checked_add(fee).ok_or(Error::Invalid("fees overflow"))
-        })?;
+        let fees = tx.fee();
         let financial = self.plan(&work.job.parent, &work.job.anchor, fees)?;
         if financial.record.finder != work.job.finder_value {
             return Err(Error::Invalid("finder allocation"));

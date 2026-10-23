@@ -7,6 +7,29 @@ use std::{
     path::Path,
 };
 
+pub(crate) fn open_lock(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    Ok(options.open(path)?)
+}
+
+pub(crate) fn validate_lock(path: &Path, file: &File) -> Result<()> {
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !opened.is_file() || !named.is_file() {
+        return Err(Error::Invalid("lock must be a regular file"));
+    }
+    #[cfg(unix)]
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(Error::Invalid("lock changed during startup"));
+    }
+    Ok(())
+}
+
 pub fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;

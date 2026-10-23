@@ -57,10 +57,6 @@ impl Default for Limits {
 }
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Cost {
-    pub topology_frames: usize,
-    pub topology_reused: usize,
-    pub window_reused: usize,
-    pub payout_reused: usize,
     pub bytes: usize,
     pub facts: usize,
     pub work: usize,
@@ -102,7 +98,7 @@ impl Budget {
             return Err(Error::Cancelled);
         }
         if Instant::now() >= self.deadline {
-            return Err(Error::Capacity("evaluation time"));
+            return Err(Error::EvaluationTime);
         }
         Ok(())
     }

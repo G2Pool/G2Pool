@@ -61,11 +61,8 @@ impl PayoutState {
 pub struct Evaluation {
     pub tip: Id,
     pub anchor: Anchor,
-    pub financial: Financial,
-    pub full: BTreeSet<Id>,
     pub(crate) primary: BTreeSet<Id>,
     pub required: BTreeSet<Key>,
-    pub cost: Cost,
 }
 struct AccountAllocation {
     canonical: u16,

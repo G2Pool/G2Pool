@@ -37,13 +37,7 @@ fn lock(node: &Arc<Mutex<Node>>) -> Result<std::sync::MutexGuard<'_, Node>> {
         .map_err(|_| Error::Invalid("node sequencer poisoned"))
 }
 fn chain_type(node: &Arc<Mutex<Node>>) -> Result<grin_core::global::ChainTypes> {
-    match lock(node)?.profile.network {
-        0 => Ok(grin_core::global::ChainTypes::Mainnet),
-        1 => Ok(grin_core::global::ChainTypes::Testnet),
-        2 => Ok(grin_core::global::ChainTypes::AutomatedTesting),
-        3 => Ok(grin_core::global::ChainTypes::UserTesting),
-        _ => Err(Error::Invalid("network")),
-    }
+    Ok(lock(node)?.profile.network)
 }
 pub(crate) fn normalize(address: SocketAddr) -> SocketAddr {
     let ip = match address.ip() {
@@ -152,7 +146,7 @@ impl Client {
             Message::Addresses(addresses) => {
                 let mut guard = lock(node)?;
                 for address in addresses {
-                    guard.peers.learn_from(address, self.address)?;
+                    guard.peers.learn_from(address, self.address);
                 }
             }
             Message::Busy => {}
@@ -371,7 +365,7 @@ fn acquire_turns(
             Ok(EvaluationProgress::Missing(key)) => key,
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(Error::View) => return Err(Error::View),
-            Err(Error::Capacity(_)) => {
+            Err(Error::Capacity(_) | Error::EvaluationTime) => {
                 queue.push_back(tip);
                 continue;
             }

@@ -148,11 +148,18 @@ fn pending_solution_retains_dependencies_through_collection_and_restart() {
         crate::storage::StorageLimits::default(),
     )
     .unwrap();
-    let mut node = Node::start(chain, profile, store, crate::limits::Limits::default()).unwrap();
+    let mut node = Node::start(
+        chain,
+        profile,
+        store,
+        crate::limits::Limits::default(),
+        crate::node::tests::synchronized(),
+    )
+    .unwrap();
     for _ in 0..4 {
         let plan = node.prepare_maintenance().unwrap().run().unwrap();
         node.finish_maintenance(
-            plan,
+            Ok(plan),
             chrono::Utc::now().timestamp() + 3600,
             &Default::default(),
         )

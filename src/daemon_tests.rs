@@ -53,7 +53,7 @@ fn locked_startup_rejects_unlinked_lock_inode_and_nonregular_paths() {
     fs::write(&lock_path, b"").unwrap();
     assert!(matches!(
         initialize_wallet(dir.path(), &lock, false, Offline),
-        Err(Error::Invalid("node lock changed during startup"))
+        Err(Error::Invalid("lock changed during startup"))
     ));
     fs::remove_file(&lock_path).unwrap();
     symlink(dir.path().join("missing"), &lock_path).unwrap();
@@ -67,7 +67,7 @@ fn locked_startup_rejects_unlinked_lock_inode_and_nonregular_paths() {
     let fifo = open_node_lock(dir.path()).unwrap();
     assert!(matches!(
         initialize_wallet(dir.path(), &fifo, false, Offline),
-        Err(Error::Invalid("node lock must be a regular file"))
+        Err(Error::Invalid("lock must be a regular file"))
     ));
 }
 fn config(arguments: &[&str]) -> Config {
@@ -77,7 +77,7 @@ fn config(arguments: &[&str]) -> Config {
     crate::cli::config(&matches).unwrap()
 }
 #[test]
-fn instance_settings_are_selected_by_directory_and_explicit_ports_override() {
+fn listener_settings_are_startup_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().to_str().unwrap();
     let selected = config(&[
@@ -91,15 +91,13 @@ fn instance_settings_are_selected_by_directory_and_explicit_ports_override() {
         "127.0.0.1:18001",
     ]);
     fs::create_dir(dir.path().join("testnet")).unwrap();
-    publish_config(
-        &dir.path().join("testnet/instance.json"),
-        &serde_json::to_vec(&Instance::from_config(&selected)).unwrap(),
-    )
-    .unwrap();
+    fs::write(dir.path().join("testnet/instance.json"), b"unused settings").unwrap();
     let restarted = config(&["--data-dir", data, "--network", "testnet"]);
     assert_eq!(restarted.network, ChainTypes::Testnet);
-    assert_eq!(restarted.grin_port, 18000);
-    assert_eq!(restarted.stratum.port(), 18001);
+    assert_eq!(selected.grin_port, 18000);
+    assert_eq!(selected.stratum.port(), 18001);
+    assert_eq!(restarted.grin_port, 13418);
+    assert_eq!(restarted.stratum.port(), 13420);
     assert_eq!(
         config(&[
             "--data-dir",

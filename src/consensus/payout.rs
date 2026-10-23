@@ -137,7 +137,6 @@ impl<S: Source> Validator<'_, '_, S> {
                 && state.financial.record.anchor == *anchor
         }) {
             self.require(&state.trace)?;
-            self.budget.cost.payout_reused += 1;
             return Ok(state.financial.clone());
         }
         let trace_start = self.traces.len();

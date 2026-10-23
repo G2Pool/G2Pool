@@ -25,7 +25,7 @@ pub fn payout_precision(receipts: usize, reserved_weight: u64) -> Result<u16> {
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub pool_id: Id,
-    pub network: u8,
+    pub network: global::ChainTypes,
     pub genesis: Id,
     pub subsidy: u64,
     pub finder_floor: u64,
@@ -42,20 +42,22 @@ pub struct Profile {
 }
 impl Profile {
     pub fn new(genesis: Id, kind: global::ChainTypes, pool: &crate::pool::Pool) -> Self {
-        let (network, receipts, share_window, lifetime, edge_bits, proof_size) = match kind {
-            global::ChainTypes::Mainnet => (0, 512, 2160, 2160, 32, 42),
-            global::ChainTypes::Testnet => (1, 512, 2160, 2160, 32, 42),
-            global::ChainTypes::AutomatedTesting => (2, 8, 3, 3, 10, 8),
-            global::ChainTypes::UserTesting => (3, 8, 3, 3, 15, 42),
+        let (receipts, share_window, lifetime, edge_bits, proof_size) = match kind {
+            global::ChainTypes::Mainnet | global::ChainTypes::Testnet => (512, 2160, 2160, 32, 42),
+            global::ChainTypes::AutomatedTesting => (8, 3, 3, 10, 8),
+            global::ChainTypes::UserTesting => (8, 3, 3, 15, 42),
         };
-        let weight = if network < 2 {
+        let weight = if matches!(
+            kind,
+            global::ChainTypes::Mainnet | global::ChainTypes::Testnet
+        ) {
             consensus::MAX_BLOCK_WEIGHT / 2
         } else {
             global::TESTING_MAX_BLOCK_WEIGHT
         };
         Self {
             pool_id: pool.id(genesis),
-            network,
+            network: kind,
             genesis,
             subsidy: 60_000_000_000,
             finder_floor: 1,
@@ -93,7 +95,10 @@ impl Profile {
             .ok_or(Error::Invalid("payout work window overflow"))
     }
     pub fn payout_weight_reservation(&self) -> u64 {
-        if self.network < 2 {
+        if matches!(
+            self.network,
+            global::ChainTypes::Mainnet | global::ChainTypes::Testnet
+        ) {
             consensus::MAX_BLOCK_WEIGHT / 2
         } else {
             global::max_block_weight()

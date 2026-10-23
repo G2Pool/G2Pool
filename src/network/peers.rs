@@ -109,7 +109,7 @@ impl Book {
         let runtime = &sharechain;
         let rows = runtime
             .read_peers()
-            .map_err(|_| Error::Invalid("peer database"))?;
+            .map_err(crate::storage::runtime_error)?;
         let mut peers = BTreeMap::<SocketAddr, Peer>::new();
         let now = chrono::Utc::now().timestamp();
         for (key, bytes) in rows {
@@ -255,15 +255,15 @@ impl Book {
         self.changed();
         Ok(())
     }
-    pub fn learn_from(&mut self, addr: SocketAddr, from: SocketAddr) -> Result<bool> {
+    pub fn learn_from(&mut self, addr: SocketAddr, from: SocketAddr) -> bool {
         let addr = crate::network::normalize(addr);
         let origin = route(from);
         self.expire(chrono::Utc::now().timestamp());
         if !learnable(addr, self.local) {
-            return Ok(false);
+            return false;
         }
         if self.peers.contains_key(&addr) {
-            return Ok(false);
+            return false;
         }
         if self
             .peers
@@ -278,7 +278,7 @@ impl Book {
                 .count()
                 >= 2
         {
-            return Ok(false);
+            return false;
         }
         if self
             .peers
@@ -311,7 +311,7 @@ impl Book {
             },
         );
         self.changed();
-        Ok(true)
+        true
     }
     pub fn addresses(&self) -> Vec<SocketAddr> {
         let mut peers: Vec<_> = self
@@ -373,17 +373,17 @@ impl Book {
             self.changed();
         }
     }
-    pub fn outcome(&mut self, addr: SocketAddr, success: bool, now: i64) -> Result<()> {
+    pub fn outcome(&mut self, addr: SocketAddr, success: bool, now: i64) {
         let addr = crate::network::normalize(addr);
         let Some(peer) = self.peers.get_mut(&addr) else {
-            return Ok(());
+            return;
         };
         if success {
             let persist = peer.failures != 0 || now.saturating_sub(peer.last_success) >= 30;
             peer.failures = 0;
             peer.retry = now;
             if !persist {
-                return Ok(());
+                return;
             }
             peer.last_success = now;
         } else {
@@ -408,7 +408,6 @@ impl Book {
             }
         }
         self.changed();
-        Ok(())
     }
     fn changed(&mut self) {
         self.generation = self.generation.saturating_add(1);
@@ -459,7 +458,7 @@ impl Persistence {
         }
         runtime
             .replace_peers(&desired)
-            .map_err(|_| Error::Capacity("peer records"))?;
+            .map_err(crate::storage::runtime_error)?;
         Ok(self.generation)
     }
 }

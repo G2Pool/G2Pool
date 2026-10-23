@@ -117,6 +117,11 @@ impl Stage {
 
 impl Node {
     pub(crate) fn prepare_stage(&self, objects: Vec<Object>) -> Result<Stage> {
+        if self.native_sync.is_syncing() {
+            return Err(Error::NativeUnavailable(
+                "Grin node is synchronizing".into(),
+            ));
+        }
         if objects.len() > crate::network::REQUEST_KEYS {
             return Err(Error::Capacity("peer staging package"));
         }
@@ -138,6 +143,7 @@ impl Node {
         })
     }
     pub(crate) fn finish_stage(&mut self, verified: VerifiedStage) -> Result<()> {
+        self.ensure_view()?;
         let view = self.view()?;
         if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Cancelled);

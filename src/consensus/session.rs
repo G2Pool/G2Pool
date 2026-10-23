@@ -194,7 +194,7 @@ impl Session {
             Ok(Some(result)) => Ok(EvaluationProgress::Ready(Box::new(result))),
             Ok(None) => Ok(EvaluationProgress::Pending),
             Err(Error::Unavailable(key)) => Ok(EvaluationProgress::Missing(key)),
-            Err(Error::Capacity("evaluation time")) => Ok(EvaluationProgress::Pending),
+            Err(Error::EvaluationTime) => Ok(EvaluationProgress::Pending),
             Err(error) => Err(error),
         }
     }
@@ -248,7 +248,6 @@ impl Session {
                     if let Some(index) = self.reuse_index {
                         if let Some(frame) = reuse.frames.get(index) {
                             v.require(&frame.trace)?;
-                            v.budget.cost.topology_reused += 1;
                             self.reuse_index = Some(index + 1);
                             continue;
                         }
@@ -280,7 +279,6 @@ impl Session {
                 let frame = v.frame(core)?;
                 let parent = frame.parent;
                 self.ledger.append(frame)?;
-                v.budget.cost.topology_frames += 1;
                 self.previous = height;
                 self.cursor = parent;
                 continue;
@@ -304,7 +302,7 @@ impl Session {
             if self.incremental {
                 v.facts.topology = Some(topology.clone());
             }
-            let financial = v.plan(&Parent::Receipt(self.tip), &self.anchor, 0)?;
+            v.plan(&Parent::Receipt(self.tip), &self.anchor, 0)?;
             v.facts.topology = Some(topology);
             v.view.check()?;
             v.budget.check()?;
@@ -314,11 +312,8 @@ impl Session {
             return Ok(Some(Evaluation {
                 tip: self.tip,
                 anchor: self.anchor.clone(),
-                financial,
-                full: self.full.clone(),
                 primary: self.primary.clone(),
                 required: v.required.clone(),
-                cost: v.budget.cost,
             }));
         }
         Ok(None)

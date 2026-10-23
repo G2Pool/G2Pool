@@ -1,8 +1,5 @@
-use crate::{objects::hex, Error, Result};
+use crate::objects::hex;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-
-pub(super) const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,12 +42,4 @@ pub fn snapshot(
         output_count,
         error,
     }
-}
-
-pub(crate) fn publish_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-        return Err(Error::Invalid("wallet snapshot size"));
-    }
-    crate::secure_file::publish_atomic(path, &bytes, true)
 }

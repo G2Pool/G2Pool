@@ -10,7 +10,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -63,7 +63,8 @@ struct Jobs {
 }
 pub struct Mining {
     native: Arc<grin_chain::Chain>,
-    network: u8,
+    native_sync: Arc<grin_chain::SyncState>,
+    network: grin_core::global::ChainTypes,
     published: Arc<std::sync::RwLock<crate::node::Published>>,
     pub node: Arc<Mutex<Node>>,
     pub wallet: Arc<Signer>,
@@ -83,12 +84,14 @@ impl Mining {
             .lock()
             .map_err(|_| Error::Invalid("node sequencer poisoned"))?;
         let native = guard.chain.clone();
+        let native_sync = guard.native_sync.clone();
         let network = guard.profile.network;
         let published = guard.published.clone();
         let solutions = crate::mining::submission::Solutions::new(&guard.store);
         drop(guard);
         Ok(Self {
             native,
+            native_sync,
             network,
             published,
             solutions,
@@ -117,6 +120,11 @@ impl Mining {
         Ok(id)
     }
     pub fn job(&self) -> Result<Value> {
+        if self.native_sync.is_syncing() {
+            return Err(Error::NativeUnavailable(
+                "Grin node is synchronizing".into(),
+            ));
+        }
         let (id, template) = {
             let mut jobs = self
                 .jobs
@@ -245,54 +253,56 @@ pub fn serve(
     max_connections: usize,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let active = Arc::new(AtomicUsize::new(0));
-    let mut workers = Vec::new();
+    let slots = crate::limits::WorkSlots::new(max_connections);
+    let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
     let network = mining.network;
-    while !stop.load(Ordering::Acquire) {
-        workers.retain(|h: &thread::JoinHandle<()>| !h.is_finished());
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if active.fetch_add(1, Ordering::AcqRel) >= max_connections {
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    continue;
+    let mut result = (|| {
+        while !stop.load(Ordering::Acquire) {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    workers
+                        .swap_remove(index)
+                        .join()
+                        .map_err(|_| Error::Invalid("Stratum worker panicked"))?;
+                } else {
+                    index += 1;
                 }
-                let mining = mining.clone();
-                let stop = stop.clone();
-                let active = active.clone();
-                workers.push(thread::spawn(move || {
-                    struct Release(Arc<AtomicUsize>);
-                    impl Drop for Release {
-                        fn drop(&mut self) {
-                            self.0.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                    let _release = Release(active);
-                    grin_core::global::set_local_chain_type(match network {
-                        0 => grin_core::global::ChainTypes::Mainnet,
-                        1 => grin_core::global::ChainTypes::Testnet,
-                        2 => grin_core::global::ChainTypes::AutomatedTesting,
-                        _ => grin_core::global::ChainTypes::UserTesting,
-                    });
-                    let _ = connection(stream, &mining, &stop);
-                }));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25))
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let Some(permit) = slots.acquire() else {
+                        continue;
+                    };
+                    let mining = mining.clone();
+                    let stop = stop.clone();
+                    workers.push(thread::spawn(move || {
+                        let _permit = permit;
+                        grin_core::global::set_local_chain_type(network);
+                        let _ = connection(stream, &mining, &stop);
+                    }));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Release);
+    for worker in workers {
+        if worker.join().is_err() && result.is_ok() {
+            result = Err(Error::Invalid("Stratum worker panicked"));
         }
     }
-    for worker in workers {
-        let _ = worker.join();
-    }
-    Ok(())
+    result
 }
 fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut accepted = 0;
-    let mut rejected = 0;
     let mut last_job = None;
     while !stop.load(Ordering::Acquire) {
         if let Ok(job) = mining.job() {
@@ -318,7 +328,6 @@ fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Resu
         let method = request.get("method").cloned().unwrap_or(Value::Null);
         let response = match mining.handle(&request) {
             Ok(result) => {
-                accepted += 1;
                 if method == "submit" {
                     let wire_result = if result["block"] == true {
                         format!(
@@ -334,13 +343,9 @@ fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Resu
                 }
             }
             Err(error) => {
-                rejected += 1;
                 json!({"jsonrpc":"2.0","id":id,"method":method,"result":null,"error":{"code":-32000,"message":error.to_string()}})
             }
         };
-        if rejected > 128 || accepted > 10000 {
-            return Err(Error::Capacity("Stratum requests"));
-        }
         serde_json::to_writer(&mut stream, &response)?;
         stream.write_all(b"\n")?;
         stream.flush()?;

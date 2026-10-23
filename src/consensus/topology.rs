@@ -99,7 +99,6 @@ impl<S: Source> Validator<'_, '_, S> {
                         if selected.contains(&entry.id) {
                             out.push((self.work(entry.id)?, entry.class));
                             if out.len() == selected.len() {
-                                self.budget.cost.window_reused += 1;
                                 return Ok(out);
                             }
                         }
@@ -108,7 +107,6 @@ impl<S: Source> Validator<'_, '_, S> {
                 if let Some(boundary) = ledger.boundary {
                     self.work(boundary)?;
                 }
-                self.budget.cost.window_reused += 1;
                 return Ok(out);
             }
         }

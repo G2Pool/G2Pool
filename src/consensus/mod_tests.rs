@@ -1,5 +1,11 @@
 use super::*;
 
+impl Facts {
+    pub(crate) fn financial(&self) -> Option<&Financial> {
+        self.payout.as_ref().map(|state| &state.financial)
+    }
+}
+
 #[test]
 fn traversal_and_ledger_payout_windows_stop_when_an_uncle_fills_the_budget() {
     let (node, _signer, _payments, _dir) = crate::node::tests::setup();

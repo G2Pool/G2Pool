@@ -1,6 +1,6 @@
 mod profile;
+pub use profile::Profile;
 pub(crate) use profile::MAX_ANCHOR_TIMESTAMP_DEVIATION;
-pub use profile::{payout_precision, Profile, NATIVE_CODEC};
 
 use crate::{codec::*, Error, Result};
 use grin_chain::{pipe, txhashset, Chain};
@@ -98,7 +98,9 @@ impl<'a> View<'a> {
     }
     pub fn anchor(&self, a: &Anchor) -> Result<BlockHeader> {
         if a.height > self.head.height {
-            return Err(Error::View);
+            return Err(Error::NativeUnavailable(
+                "Grin anchor is ahead of the local chain".into(),
+            ));
         }
         let h = self
             .chain

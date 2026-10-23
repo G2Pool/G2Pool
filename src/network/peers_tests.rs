@@ -9,7 +9,7 @@ fn bans_filter_seed_targets_and_gossip_without_persisting() {
     let other: SocketAddr = "9.9.9.9:3417".parse().unwrap();
     let mut book = Book::open(path.clone(), [1; 32], false, &[seed, other]).unwrap();
     let now = chrono::Utc::now().timestamp();
-    book.outcome(seed, true, now).unwrap();
+    book.outcome(seed, true, now);
     book.bans.ban(seed.ip(), super::super::bans::DEFAULT_BAN);
     assert!(!book.targets(now, &[], OUTBOUND_PEERS).contains(&seed));
     assert!(book.targets(now, &[], OUTBOUND_PEERS).contains(&other));
@@ -46,7 +46,7 @@ fn public_discovery_excludes_special_routes_but_allows_explicit_seeds() {
     ] {
         let address = SocketAddr::new(ip.parse().unwrap(), 3417);
         let mut book = Book::memory(false);
-        assert!(!book.learn(address).unwrap(), "learned {ip}");
+        assert!(!book.learn(address), "learned {ip}");
         book.seed(address).unwrap();
         assert_eq!(
             book.targets(0, &[], OUTBOUND_PEERS),
@@ -94,7 +94,7 @@ fn reopening_rechecks_learned_routes_without_removing_configured_seeds() {
     let learned = "100.64.0.1:3417".parse().unwrap();
     let seed = "[2001:db8::1]:3417".parse().unwrap();
     let mut book = Book::open(path.clone(), [1; 32], true, &[seed]).unwrap();
-    assert!(book.learn(learned).unwrap());
+    assert!(book.learn(learned));
     book.flush().unwrap();
     drop(book);
     let book = Book::open(path, [1; 32], false, &[seed]).unwrap();
@@ -105,22 +105,16 @@ fn hostile_rumours_cannot_gossip_private_routes_or_fence_other_sources() {
     let mut book = Book::memory(false);
     let origin = "8.8.8.8:3417".parse().unwrap();
     for subnet in 0..128 {
-        let _ = book
-            .learn_from(format!("11.{subnet}.1.1:3417").parse().unwrap(), origin)
-            .unwrap();
+        let _ = book.learn_from(format!("11.{subnet}.1.1:3417").parse().unwrap(), origin);
     }
     assert_eq!(book.known().len(), 16);
     assert!(book.addresses().is_empty());
     let honest = "51.83.197.245:3417".parse().unwrap();
-    assert!(book
-        .learn_from(honest, "9.9.9.9:3417".parse().unwrap())
-        .unwrap());
-    book.outcome(honest, true, chrono::Utc::now().timestamp())
-        .unwrap();
+    assert!(book.learn_from(honest, "9.9.9.9:3417".parse().unwrap()));
+    book.outcome(honest, true, chrono::Utc::now().timestamp());
     let private = "127.0.0.1:3417".parse().unwrap();
     book.seed(private).unwrap();
-    book.outcome(private, true, chrono::Utc::now().timestamp())
-        .unwrap();
+    book.outcome(private, true, chrono::Utc::now().timestamp());
     assert_eq!(book.addresses(), vec![honest]);
 }
 #[test]
@@ -128,7 +122,7 @@ fn expired_hints_leave_the_routing_set_without_a_restart() {
     let mut book = Book::memory(false);
     let hint = "8.8.8.8:3417".parse().unwrap();
     let seed = "51.83.197.245:3417".parse().unwrap();
-    book.learn(hint).unwrap();
+    book.learn(hint);
     book.seed(seed).unwrap();
     let heard = book.peers[&hint].heard;
     assert!(book.targets(heard, &[], OUTBOUND_PEERS).contains(&hint));
@@ -175,11 +169,11 @@ fn malformed_routing_rows_do_not_recreate_wallet_state() {
 fn reachability_does_not_make_a_sparse_peer_a_productive_gossip_source() {
     let mut book = Book::memory(false);
     let peer = "8.8.8.8:3417".parse().unwrap();
-    book.learn(peer).unwrap();
+    book.learn(peer);
     book.reached(peer, 100);
     assert!(book.targets(100, &[], OUTBOUND_PEERS).contains(&peer));
     assert!(book.addresses().is_empty());
-    let _ = book.outcome(peer, true, 100);
+    book.outcome(peer, true, 100);
     assert!(book.addresses().contains(&peer));
 }
 
@@ -195,11 +189,11 @@ impl Book {
             crate::storage::sharechain::MAP_BYTES,
             pool_id,
         )
-        .map_err(|_| Error::Invalid("peer database identity"))?;
+        .map_err(crate::storage::runtime_error)?;
         Self::from_database(sharechain, local, seeds)
     }
 
-    fn learn(&mut self, addr: SocketAddr) -> Result<bool> {
+    fn learn(&mut self, addr: SocketAddr) -> bool {
         self.learn_from(addr, addr)
     }
 
@@ -221,10 +215,10 @@ fn failed_connections_back_off_but_successes_have_no_probe_cooldown() {
     let peer = "8.8.8.8:3417".parse().unwrap();
     let mut book = Book::memory(false);
     book.seed(peer).unwrap();
-    book.outcome(peer, false, 100).unwrap();
+    book.outcome(peer, false, 100);
     assert!(!book.targets(101, &[], OUTBOUND_PEERS).contains(&peer));
     assert!(book.targets(102, &[], OUTBOUND_PEERS).contains(&peer));
-    book.outcome(peer, true, 102).unwrap();
+    book.outcome(peer, true, 102);
     assert_eq!(book.peers[&peer].failures, 0);
     assert!(book.targets(102, &[], OUTBOUND_PEERS).contains(&peer));
 }

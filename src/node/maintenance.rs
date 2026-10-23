@@ -42,17 +42,18 @@ impl Node {
     }
     pub fn finish_maintenance(
         &mut self,
-        result: MaintenanceResult,
+        result: Result<MaintenanceResult>,
         older_than: i64,
         extra: &BTreeSet<Key>,
     ) -> Result<usize> {
         if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        self.ensure_view()?;
         let keep = self.collection_keep(extra)?;
-        self.store.apply_compaction(result.compaction)?;
         let collected = self.store.collect(&keep, older_than)?;
+        let result = result?;
+        self.ensure_view()?;
+        self.store.apply_compaction(result.compaction)?;
         Ok(collected)
     }
 }
