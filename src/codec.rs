@@ -2,7 +2,6 @@ use crate::{Error, Result};
 pub type Id = [u8; 32];
 pub type Point = [u8; 33];
 pub type Sig = [u8; 64];
-pub const VERSION: u16 = 1;
 pub const MAX_ENCODING_ENTRIES: usize = 2048;
 pub const MAX_PAYOUT_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
@@ -245,7 +244,6 @@ object!(Reward=> ("REWARD",4096),Coupon=> ("COUPON",2048),
     Job=> ("INDEPENDENT_JOB",2048),Core=> ("WORK_CORE",16384),Residual=> ("RESIDUAL_BODY",8388608));
 pub fn encode<T: Object>(value: &T) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    VERSION.write(&mut out)?;
     value.write(&mut out)?;
     if out.len() > T::MAX {
         return Err(Error::Invalid("object ceiling"));
@@ -257,9 +255,6 @@ pub fn decode<T: Object>(bytes: &[u8]) -> Result<T> {
         return Err(Error::Invalid("object ceiling"));
     }
     let mut r = Reader { bytes, offset: 0 };
-    if u16::read(&mut r)? != VERSION {
-        return Err(Error::Invalid("schema version"));
-    }
     let value = T::read(&mut r)?;
     if r.offset != bytes.len() {
         return Err(Error::Invalid("trailing bytes"));
@@ -267,14 +262,13 @@ pub fn decode<T: Object>(bytes: &[u8]) -> Result<T> {
     Ok(value)
 }
 pub fn hash(domain: &str, bytes: &[u8]) -> Id {
-    let mut frame = format!("G2POOL_{domain}\0").into_bytes();
-    frame.extend(VERSION.to_be_bytes());
-    frame.extend((bytes.len() as u32).to_be_bytes());
-    frame.extend(bytes);
-    blake2::blake2b::blake2b(32, &[], &frame)
-        .as_bytes()
-        .try_into()
-        .unwrap()
+    let mut state = blake2::blake2b::Blake2b::new(32);
+    state.update(b"G2POOL_");
+    state.update(domain.as_bytes());
+    state.update(b"\0");
+    state.update(&(bytes.len() as u32).to_be_bytes());
+    state.update(bytes);
+    state.finalize().as_bytes().try_into().unwrap()
 }
 pub fn id<T: Object>(value: &T) -> Result<Id> {
     Ok(hash(T::DOMAIN, &encode(value)?))
@@ -292,27 +286,20 @@ pub fn scalar(job: Id) -> Result<[u8; 32]> {
     Err(Error::Invalid("scalar rejection bound"))
 }
 
-pub fn roundtrip(domain: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+pub fn validate(domain: &str, bytes: &[u8]) -> Result<()> {
     macro_rules! go {
         ($t:ty) => {
-            encode(&decode::<$t>(bytes)?)
+            decode::<$t>(bytes).map(|_| ())
         };
     }
     match domain {
-        "REWARD" => go!(Reward),
         "COUPON" => go!(Coupon),
         "INVENTORY" => go!(Inventory),
-        "REGISTRATION_AUTH" => go!(RegistrationAuth),
         "REGISTRATION" => go!(Registration),
-        "COUPON_AUTH" => go!(CouponAuth),
-        "WORK_AUTH" => go!(WorkAuthMessage),
         "WORK_AUTHORIZATION" => go!(WorkAuthorization),
-        "PAYOUT_RECORD" => go!(PayoutRecord),
         "KERNEL_ENCODING_PLAN" => go!(EncodingPlan),
         "TX_ONLY" => go!(TxOnly),
-        "KERNEL" => go!(Kernel),
         "FINDER_OUTPUT" => go!(FinderOutput),
-        "INDEPENDENT_JOB" => go!(Job),
         "WORK_CORE" => go!(Core),
         "RESIDUAL_BODY" => go!(Residual),
         _ => Err(Error::Invalid("unknown object domain")),

@@ -6,7 +6,7 @@ use crate::{
     native::{self, Work},
     node::Node,
     objects::{Key, Kind, Source},
-    storage::{Object, Revision},
+    storage::{Object, Representation, Revision},
     wallet::{kernel, Signer},
     Error, Result,
 };
@@ -39,7 +39,7 @@ pub(crate) struct Preparation {
 pub(crate) struct Prepared {
     template: Template,
     registration: crate::wallet::RegistrationPlan,
-    bindings: std::collections::BTreeMap<Key, (u8, Id)>,
+    bindings: std::collections::BTreeMap<Key, (Representation, Id)>,
     checked_at: i64,
 }
 impl Prepared {

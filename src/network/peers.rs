@@ -4,6 +4,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
 };
+pub(crate) const MAX_SEEDS: usize = 64;
+
+pub(crate) fn validate_seed(addr: SocketAddr) -> Result<SocketAddr> {
+    let addr = crate::network::normalize(addr);
+    if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return Err(Error::Invalid("seed address"));
+    }
+    Ok(addr)
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Peer {
     heard: i64,
@@ -208,12 +217,9 @@ impl Book {
         Self::from_database(store.database(), local, seeds)
     }
     pub fn seed(&mut self, addr: SocketAddr) -> Result<()> {
-        let addr = crate::network::normalize(addr);
-        if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
-            return Err(Error::Invalid("seed address"));
-        }
+        let addr = validate_seed(addr)?;
         if !self.peers.get(&addr).is_some_and(|p| p.seed)
-            && self.peers.values().filter(|p| p.seed).count() >= 64
+            && self.peers.values().filter(|p| p.seed).count() >= MAX_SEEDS
         {
             return Err(Error::Capacity("peer seeds"));
         }

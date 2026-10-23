@@ -1,9 +1,10 @@
 pub mod compact;
 pub mod sharechain;
+pub(crate) use crate::storage::sharechain::Representation;
 use crate::storage::sharechain::{
-    ObjectMode, RoutingKey, RuntimeBatch, RuntimeHead, RuntimeLease, RuntimeLimits, RuntimeObject,
-    RuntimeReplacement, RuntimeRevision, RuntimeSnapshot, RuntimeStore,
-    StoredObject as PhysicalObject,
+    physical_digest, ObjectMode, RoutingKey, RuntimeBatch, RuntimeHead, RuntimeLease,
+    RuntimeLimits, RuntimeObject, RuntimeReplacement, RuntimeRevision, RuntimeSnapshot,
+    RuntimeStore, StoredObject as PhysicalObject,
 };
 use crate::{
     codec::*,
@@ -125,14 +126,8 @@ pub(crate) fn runtime_error(error: crate::storage::sharechain::Error) -> Error {
         E::Database(heed::Error::Mdb(heed::MdbError::MapFull)) => Error::Capacity("LMDB map full"),
         E::Database(error) => Error::Storage(error),
         E::Invalid(message) => Error::Invalid(message),
-        _ => Error::Invalid("runtime storage"),
+        E::Missing => Error::Invalid("missing sharechain object"),
     }
-}
-fn physical_digest(bytes: &[u8]) -> Id {
-    blake2::blake2b::blake2b(32, &[], bytes)
-        .as_bytes()
-        .try_into()
-        .unwrap()
 }
 fn runtime_revision(revision: &Revision) -> RuntimeRevision {
     RuntimeRevision {
@@ -254,15 +249,20 @@ impl Store {
         }
         Ok(physical)
     }
-    pub(crate) fn binding(&self, key: Key) -> Result<(u8, Id)> {
-        let physical = self.physical(key)?;
-        Ok((
-            physical
-                .format
-                .try_into()
-                .map_err(|_| Error::Invalid("stored format"))?,
-            hash("STAGING_SOURCE", &physical.bytes),
-        ))
+    fn variant(&self, key: Key) -> Result<sharechain::RuntimeVariant> {
+        let variant = self
+            .snapshot()?
+            .preferred_variant(route(key))
+            .map_err(runtime_error)?
+            .ok_or(Error::Unavailable(key))?;
+        if variant.byte_len > key.kind.ceiling() as u64 {
+            return Err(Error::Invalid("stored object ceiling"));
+        }
+        Ok(variant)
+    }
+    pub(crate) fn binding(&self, key: Key) -> Result<(Representation, Id)> {
+        let variant = self.variant(key)?;
+        Ok((variant.representation, variant.digest))
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -349,11 +349,6 @@ impl Store {
             .map_err(runtime_error)?;
         Ok(())
     }
-    pub fn usage(&self) -> Result<(u64, u64)> {
-        let (count, bytes) = self.snapshot()?.usage().map_err(runtime_error)?;
-        Ok((bytes, count))
-    }
-
     pub(crate) fn stage_checked(&mut self, objects: &[Object]) -> Result<()> {
         self.stage_with(objects, |_| Ok(()))
     }
@@ -371,7 +366,7 @@ impl Store {
                     .object(route(object.key), None)
                     .map_err(runtime_error)?
                 {
-                    if old.format == 1 {
+                    if old.representation == Representation::Compact {
                         if physical_digest(&object.bytes) != old.logical_digest {
                             return Err(Error::Invalid("conflicting content"));
                         }
@@ -386,7 +381,7 @@ impl Store {
                 } else {
                     ObjectMode::Immutable
                 },
-                format: 0,
+                representation: Representation::Canonical,
                 logical_digest: physical_digest(&object.bytes),
                 bytes: &object.bytes,
             });
@@ -519,7 +514,7 @@ impl Store {
             .map(|object| RuntimeObject {
                 key: route(object.key),
                 mode: ObjectMode::WorkVariant,
-                format: 0,
+                representation: Representation::Canonical,
                 logical_digest: physical_digest(&object.bytes),
                 bytes: &object.bytes,
             })
@@ -662,25 +657,24 @@ impl Store {
             .map_err(runtime_error)
     }
     pub fn byte_length(&self, key: Key) -> Result<usize> {
-        let physical = self.physical(key)?;
-        Ok(if physical.format == 1 {
+        let variant = self.variant(key)?;
+        Ok(if variant.representation == Representation::Compact {
             key.kind.ceiling()
         } else {
-            physical.bytes.len()
+            variant.byte_len as usize
         })
     }
     pub fn parent_hint(&self, work: Id) -> Result<Parent> {
         let physical = self.physical(Key::new(Kind::Core, work))?;
-        match physical.format {
-            0 => {
+        match physical.representation {
+            Representation::Canonical => {
                 let core: Core = decode(&physical.bytes)?;
                 if hash("WORK_ID", &core.header.0) != work {
                     return Err(Error::Invalid("stored core identity"));
                 }
                 Ok(decode::<Job>(&core.job.0)?.parent)
             }
-            1 => crate::storage::compact::parent_hint(&physical.bytes),
-            _ => Err(Error::Invalid("stored format")),
+            Representation::Compact => crate::storage::compact::parent_hint(&physical.bytes),
         }
     }
     pub(crate) fn prepare_compaction(
@@ -714,7 +708,7 @@ impl Store {
             }
             next_cursor = Some((routing, variant.digest));
             processed += 1;
-            if variant.format != 0 {
+            if variant.representation != Representation::Canonical {
                 continue;
             }
             let physical = snapshot
@@ -765,14 +759,16 @@ impl Store {
             if snapshot
                 .object(route(*key), None)
                 .map_err(runtime_error)?
-                .is_some_and(|old| old.digest == *digest && old.format == 0)
+                .is_some_and(|old| {
+                    old.digest == *digest && old.representation == Representation::Canonical
+                })
             {
                 replacements.push(RuntimeReplacement {
                     key: route(*key),
                     logical_digest: *digest,
                     expected_digest: *digest,
-                    expected_format: 0,
-                    format: 1,
+                    expected_representation: Representation::Canonical,
+                    representation: Representation::Compact,
                     bytes: packed,
                 });
             }
@@ -798,9 +794,9 @@ impl Store {
 impl Source for Store {
     fn read(&self, key: Key) -> Result<Arc<[u8]>> {
         let physical = self.physical(key)?;
-        let bytes = match physical.format {
-            0 => physical.bytes,
-            1 if key.kind == Kind::Core => {
+        let bytes = match physical.representation {
+            Representation::Canonical => physical.bytes,
+            Representation::Compact if key.kind == Kind::Core => {
                 let (chain, profile) = self.native.as_ref().ok_or(Error::NativeUnavailable(
                     "compact store needs native view".into(),
                 ))?;
@@ -815,7 +811,7 @@ impl Source for Store {
                 }
                 bytes
             }
-            _ => return Err(Error::Invalid("stored format")),
+            Representation::Compact => return Err(Error::Invalid("compact object kind")),
         };
         Key::checked(key.kind, key.id, &bytes)?;
         self.check_reader()?;

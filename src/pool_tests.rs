@@ -39,11 +39,9 @@ fn default_creation_regeneration_and_explicit_selection() {
 fn identity_uses_key_then_native_genesis_and_excludes_discovery_metadata() {
     let mut pool = Pool::alpha();
     pool.key = [1; 32];
-    let mut input = [1; 64];
-    input[32..].fill(2);
     assert_eq!(
-        pool.id([2; 32]).as_slice(),
-        blake2::blake2b::blake2b(32, &[], &input).as_bytes()
+        crate::objects::hex(&pool.id([2; 32])),
+        "c3cdb96d41163cab8a9ee523534c107bff2de53dd11bf027649865caada63e8c"
     );
     let id = pool.id([2; 32]);
     pool.name = "renamed".into();
@@ -130,4 +128,26 @@ fn bootstrap_overrides_replace_defaults_and_custom_pools_cannot_inherit_alpha_pe
         Pool::load(dir.path(), None),
         Err(Error::Invalid("custom pool requires bootstrap_peers"))
     ));
+}
+
+#[test]
+fn bootstrap_validation_counts_distinct_normalized_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("custom.json");
+    let mut pool = Pool::alpha();
+    pool.bootstrap_peers = Some(BootstrapPeers {
+        mainnet: (0..=crate::network::peers::MAX_SEEDS)
+            .map(|n| format!("11.0.{n}.1:3417").parse().unwrap())
+            .collect(),
+        testnet: vec![],
+    });
+    secure_file::publish_atomic(&path, &serde_json::to_vec(&pool).unwrap(), false).unwrap();
+    assert!(matches!(
+        Pool::load(dir.path(), Some(&path)),
+        Err(Error::Capacity("peer seeds"))
+    ));
+    pool.bootstrap_peers.as_mut().unwrap().mainnet =
+        vec!["11.0.0.1:3417".parse().unwrap(); crate::network::peers::MAX_SEEDS + 1];
+    secure_file::publish_atomic(&path, &serde_json::to_vec(&pool).unwrap(), true).unwrap();
+    assert!(Pool::load(dir.path(), Some(&path)).is_ok());
 }

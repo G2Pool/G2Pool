@@ -4,33 +4,26 @@ use std::{fmt, sync::Arc};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Kind {
-    Reward = 1,
-    Coupon,
-    Inventory,
-    Registration,
-    Payout,
-    Encoding,
-    Transaction,
-    Kernel,
-    Finder,
-    Job,
-    Core,
-    Authorization,
-    Residual,
+    Coupon = 2,
+    Inventory = 3,
+    Registration = 4,
+    Encoding = 6,
+    Transaction = 7,
+    Finder = 9,
+    Core = 11,
+    Authorization = 12,
+    Residual = 13,
 }
+
 impl Kind {
     pub fn from_byte(byte: u8) -> Result<Self> {
         match byte {
-            1 => Ok(Self::Reward),
             2 => Ok(Self::Coupon),
             3 => Ok(Self::Inventory),
             4 => Ok(Self::Registration),
-            5 => Ok(Self::Payout),
             6 => Ok(Self::Encoding),
             7 => Ok(Self::Transaction),
-            8 => Ok(Self::Kernel),
             9 => Ok(Self::Finder),
-            10 => Ok(Self::Job),
             11 => Ok(Self::Core),
             12 => Ok(Self::Authorization),
             13 => Ok(Self::Residual),
@@ -39,16 +32,12 @@ impl Kind {
     }
     pub fn domain(self) -> &'static str {
         match self {
-            Self::Reward => "REWARD",
             Self::Coupon => "COUPON",
             Self::Inventory => "INVENTORY",
             Self::Registration => "REGISTRATION",
-            Self::Payout => "PAYOUT_RECORD",
             Self::Encoding => "KERNEL_ENCODING_PLAN",
             Self::Transaction => "TX_ONLY",
-            Self::Kernel => "KERNEL",
             Self::Finder => "FINDER_OUTPUT",
-            Self::Job => "INDEPENDENT_JOB",
             Self::Core => "WORK_CORE",
             Self::Authorization => "WORK_AUTHORIZATION",
             Self::Residual => "RESIDUAL_BODY",
@@ -56,16 +45,12 @@ impl Kind {
     }
     pub fn ceiling(self) -> usize {
         match self {
-            Self::Reward => <Reward as Object>::MAX,
             Self::Coupon => <Coupon as Object>::MAX,
             Self::Inventory => <Inventory as Object>::MAX,
             Self::Registration => <Registration as Object>::MAX,
-            Self::Payout => <PayoutRecord as Object>::MAX,
             Self::Encoding => <EncodingPlan as Object>::MAX,
             Self::Transaction => <TxOnly as Object>::MAX,
-            Self::Kernel => <Kernel as Object>::MAX,
             Self::Finder => <FinderOutput as Object>::MAX,
-            Self::Job => <Job as Object>::MAX,
             Self::Core => <Core as Object>::MAX,
             Self::Authorization => <WorkAuthorization as Object>::MAX,
             Self::Residual => <Residual as Object>::MAX,
@@ -83,9 +68,9 @@ macro_rules! stored {
         impl StoredObject for $record { const KIND: Kind=Kind::$kind; }
     )*};
 }
-stored!(Reward=>Reward,Coupon=>Coupon,Inventory=>Inventory,
-    Registration=>Registration,PayoutRecord=>Payout,EncodingPlan=>Encoding,
-    TxOnly=>Transaction,Kernel=>Kernel,FinderOutput=>Finder,Job=>Job);
+stored!(Coupon=>Coupon,Inventory=>Inventory,
+    Registration=>Registration,EncodingPlan=>Encoding,
+    TxOnly=>Transaction,FinderOutput=>Finder);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
@@ -100,7 +85,7 @@ impl Key {
         if bytes.len() > kind.ceiling() {
             return Err(Error::Invalid("object ceiling"));
         }
-        roundtrip(kind.domain(), bytes).map_err(|error| {
+        validate(kind.domain(), bytes).map_err(|error| {
             if kind == Kind::Authorization {
                 Error::Witness("work authorization encoding")
             } else {

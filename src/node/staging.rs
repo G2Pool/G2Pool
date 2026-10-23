@@ -19,12 +19,12 @@ pub(crate) struct VerifiedStage {
     anchor: Anchor,
     objects: Vec<Object>,
     checked_at: i64,
-    dependencies: BTreeMap<Key, (u8, Id)>,
+    dependencies: BTreeMap<Key, (Representation, Id)>,
 }
 
 struct TrackedSource {
     store: Store,
-    dependencies: RefCell<BTreeMap<Key, (u8, Id)>>,
+    dependencies: RefCell<BTreeMap<Key, (Representation, Id)>>,
 }
 impl Source for TrackedSource {
     fn read(&self, key: Key) -> Result<Arc<[u8]>> {

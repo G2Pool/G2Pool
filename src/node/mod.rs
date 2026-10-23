@@ -11,7 +11,7 @@ use crate::{
     limits::Limits,
     native::{Profile, View, Work},
     objects::{Key, Kind, Source},
-    storage::{Object, Revision, Store},
+    storage::{Object, Representation, Revision, Store},
     Error, Result,
 };
 use grin_chain::Chain;

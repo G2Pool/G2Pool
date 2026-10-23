@@ -6,7 +6,8 @@ use crate::{
     objects::{Key, Kind, Source},
     storage::{
         sharechain::{
-            ObjectMode, RoutingKey, RuntimeBatch, RuntimeObject, RuntimeStore, SharechainDb,
+            physical_digest, ObjectMode, RoutingKey, RuntimeBatch, RuntimeObject, RuntimeStore,
+            SharechainDb,
         },
         Object, Store,
     },
@@ -114,7 +115,7 @@ impl Solutions {
                     ObjectMode::Immutable
                 },
                 logical_digest: physical_digest(&object.bytes),
-                format: 0,
+                representation: crate::storage::sharechain::Representation::Canonical,
                 bytes: &object.bytes,
             })
             .collect();
@@ -360,12 +361,6 @@ impl Solutions {
         }
         Ok(objects)
     }
-}
-fn physical_digest(bytes: &[u8]) -> Id {
-    blake2::blake2b::blake2b(32, &[], bytes)
-        .as_bytes()
-        .try_into()
-        .unwrap()
 }
 fn retention(id: Id) -> Id {
     codec::hash("SOLUTION_RETENTION", &id)

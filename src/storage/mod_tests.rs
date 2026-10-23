@@ -19,6 +19,10 @@ fn quota_errors_are_retryable_without_hiding_corrupt_metadata_or_database_errors
         runtime_error(E::Database(heed::Error::Mdb(heed::MdbError::MapFull))),
         Error::Capacity(_)
     ));
+    assert!(matches!(
+        runtime_error(E::Missing),
+        Error::Invalid("missing sharechain object")
+    ));
 }
 fn inventory() -> Object {
     Object::content(&Inventory {

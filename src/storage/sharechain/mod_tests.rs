@@ -2,6 +2,34 @@ use super::*;
 use tempfile::tempdir;
 
 #[test]
+fn storage_format_is_the_only_persistent_layout_marker() {
+    for (key, value, expected) in [
+        ("storage_format", Some(2u32.to_be_bytes()), "storage format"),
+        ("storage_format", None, "storage format"),
+        ("pool_id", None, "pool identity mismatch"),
+    ] {
+        let dir = tempdir().unwrap();
+        let db = SharechainDb::open(dir.path(), 1 << 24, [42; 32]).unwrap();
+        let mut tx = db.env.write_txn().unwrap();
+        let meta: Database<Bytes, Bytes> =
+            db.env.open_database(&tx, Some("meta")).unwrap().unwrap();
+        match value {
+            Some(value) => meta.put(&mut tx, key.as_bytes(), &value).unwrap(),
+            None => {
+                meta.delete(&mut tx, key.as_bytes()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(db);
+        match SharechainDb::open(dir.path(), 1 << 24, [77; 32]) {
+            Err(Error::Invalid(message)) => assert_eq!(message, expected),
+            Err(error) => panic!("unexpected open error: {error}"),
+            Ok(_) => panic!("accepted invalid {key}"),
+        }
+    }
+}
+
+#[test]
 fn routing_namespace_updates_are_atomic_and_isolated() {
     let dir = tempdir().unwrap();
     let db = SharechainDb::open(dir.path(), 1 << 24, [42; 32]).unwrap();

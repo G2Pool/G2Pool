@@ -6,19 +6,46 @@ pub(crate) use budget::{SOLUTION_RECORDS, WRITE_RESERVE};
 mod dependencies;
 mod routing;
 mod runtime_store;
-pub(crate) use dependencies::{
-    DependencyBatch, DependencyKey, DependencyManifest, DependencyObject,
-};
+pub(crate) use dependencies::DependencyManifest;
 pub(crate) use runtime_store::{
-    ObjectMode, RoutingKey, RuntimeBatch, RuntimeHead, RuntimeLease, RuntimeLimits, RuntimeObject,
-    RuntimeReplacement, RuntimeRevision, RuntimeSnapshot, RuntimeStore, StoredObject,
+    ObjectMode, Representation, RuntimeBatch, RuntimeHead, RuntimeLease, RuntimeLimits,
+    RuntimeObject, RuntimeReplacement, RuntimeRevision, RuntimeSnapshot, RuntimeStore,
+    RuntimeVariant, StoredObject,
 };
 use std::path::Path;
 
 pub(crate) const ACQUISITION_LIFETIME: u64 = 900;
+pub(crate) const STORAGE_FORMAT: u32 = 1;
 pub const MAP_BYTES: usize = 1 << 30;
 pub type Id = [u8; 32];
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub(crate) fn physical_digest(bytes: &[u8]) -> Id {
+    crate::codec::hash("PHYSICAL_OBJECT", bytes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutingKey {
+    pub kind: u8,
+    pub id: Id,
+}
+impl RoutingKey {
+    fn bytes(self) -> [u8; 33] {
+        let mut bytes = [0; 33];
+        bytes[0] = self.kind;
+        bytes[1..].copy_from_slice(&self.id);
+        bytes
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 33 {
+            return Err(Error::Invalid("routing key"));
+        }
+        Ok(Self {
+            kind: bytes[0],
+            id: bytes[1..].try_into().unwrap(),
+        })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -32,8 +59,6 @@ pub enum Error {
     Stale,
     #[error("missing sharechain object")]
     Missing,
-    #[error("object is retained")]
-    ProtectedBody,
     #[error("storage quota exceeded: {0}")]
     Quota(&'static str),
 }
@@ -62,23 +87,23 @@ impl SharechainDb {
                 .open(path)?
         };
         let mut tx = env.write_txn()?;
-        let runtime = env.create_database(&mut tx, Some("runtime_store"))?;
+        let catalog: Database<Bytes, Bytes> = env
+            .open_database(&tx, None)?
+            .ok_or(Error::Invalid("database catalog missing"))?;
+        let initializing = catalog.is_empty(&tx)?;
         let meta: Database<Bytes, Bytes> = env.create_database(&mut tx, Some("meta"))?;
-        match meta.get(&tx, b"schema")? {
-            Some(b"pool-sharechain") => {}
-            Some(_) => return Err(Error::Invalid("schema")),
-            None => meta.put(&mut tx, b"schema", b"pool-sharechain")?,
-        }
-        match meta.get(&tx, b"pool_id")? {
-            Some(previous) if previous != pool_id.as_slice() => {
-                return Err(Error::Invalid("pool identity mismatch"))
+        if initializing {
+            meta.put(&mut tx, b"storage_format", &STORAGE_FORMAT.to_be_bytes())?;
+            meta.put(&mut tx, b"pool_id", &pool_id)?;
+        } else {
+            if meta.get(&tx, b"storage_format")? != Some(STORAGE_FORMAT.to_be_bytes().as_slice()) {
+                return Err(Error::Invalid("storage format"));
             }
-            Some(previous) if previous.len() != 32 => {
-                return Err(Error::Invalid("pool identity encoding"))
+            if meta.get(&tx, b"pool_id")? != Some(pool_id.as_slice()) {
+                return Err(Error::Invalid("pool identity mismatch"));
             }
-            Some(_) => {}
-            None => meta.put(&mut tx, b"pool_id", &pool_id)?,
         }
+        let runtime = env.create_database(&mut tx, Some("runtime_store"))?;
         tx.commit()?;
         let budget = budget::DatabaseBudget::new(env.clone(), map_bytes as u64);
         Ok(Self {

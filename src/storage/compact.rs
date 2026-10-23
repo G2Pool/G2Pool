@@ -10,7 +10,6 @@ use grin_keychain::BlindingFactor;
 
 #[derive(Debug, Clone)]
 struct Local {
-    format: u8,
     output_root: Id,
     range_root: Id,
     kernel_root: Id,
@@ -23,7 +22,6 @@ struct Local {
 impl Field for Local {
     fn read(r: &mut Reader<'_>) -> Result<Self> {
         Ok(Self {
-            format: u8::read(r)?,
             output_root: Id::read(r)?,
             range_root: Id::read(r)?,
             kernel_root: Id::read(r)?,
@@ -35,7 +33,6 @@ impl Field for Local {
         })
     }
     fn write(&self, out: &mut Vec<u8>) -> Result<()> {
-        self.format.write(out)?;
         self.output_root.write(out)?;
         self.range_root.write(out)?;
         self.kernel_root.write(out)?;
@@ -66,7 +63,6 @@ pub fn pack(work: &Work, view: &View<'_>) -> Result<Vec<u8>> {
         .checked_sub(parent.kernel_mmr_count())
         .ok_or(Error::Invalid("local kernels"))?;
     let local = Local {
-        format: 1,
         output_root: native::hash_bytes(h.output_root),
         range_root: native::hash_bytes(h.range_proof_root),
         kernel_root: native::hash_bytes(h.kernel_root),
@@ -80,36 +76,15 @@ pub fn pack(work: &Work, view: &View<'_>) -> Result<Vec<u8>> {
         proof: Blob(native::native_bytes(&h.pow.proof)?),
         job: Blob(encode(work.job())?),
     };
-    let packed = encode(&local)?;
-    let canonical = unpack(&packed, view)?;
-    if canonical
-        != encode(&Core {
-            header: Blob(native::native_bytes(h)?),
-            job: local.job,
-        })?
-    {
-        return Err(Error::Invalid("local compaction changed native bytes"));
-    }
-    Ok(packed)
+    encode(&local)
 }
 pub fn parent_hint(bytes: &[u8]) -> Result<Parent> {
     let local: Local = decode(bytes)?;
-    if local.format != 1 {
-        return Err(Error::Invalid("local format"));
-    }
     let job: Job = decode(&local.job.0)?;
     Ok(job.parent)
 }
-pub fn unpack(bytes: &[u8], view: &View<'_>) -> Result<Vec<u8>> {
-    let wire = expand(bytes, view)?;
-    Work::verify(&wire, view)?;
-    Ok(wire)
-}
 pub(crate) fn expand(bytes: &[u8], view: &View<'_>) -> Result<Vec<u8>> {
     let local: Local = decode(bytes)?;
-    if local.format != 1 {
-        return Err(Error::Invalid("local format"));
-    }
     let job: Job = decode(&local.job.0)?;
     if job.pool_id != view.profile.pool_id {
         return Err(Error::Invalid("local profile"));

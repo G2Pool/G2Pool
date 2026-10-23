@@ -1,5 +1,5 @@
 use super::*;
-use crate::storage::sharechain::{runtime_store::*, SharechainDb};
+use crate::storage::sharechain::{runtime_store::*, RoutingKey, SharechainDb};
 
 #[test]
 fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space() {
@@ -56,11 +56,8 @@ fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space()
                         id: [1; 32]
                     },
                     mode: ObjectMode::Immutable,
-                    format: 0,
-                    logical_digest: blake2::blake2b::blake2b(32, &[], &bytes)
-                        .as_bytes()
-                        .try_into()
-                        .unwrap(),
+                    representation: Representation::Canonical,
+                    logical_digest: crate::codec::hash("PHYSICAL_OBJECT", &bytes),
                     bytes: &bytes
                 }],
                 heads: &[RuntimeHead {
@@ -174,10 +171,7 @@ fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
     };
     let runtime = db.runtime_store(limits).unwrap();
     let payload = vec![1; 3 * 1024 * 1024];
-    let digest = blake2::blake2b::blake2b(32, &[], &payload)
-        .as_bytes()
-        .try_into()
-        .unwrap();
+    let digest = crate::codec::hash("PHYSICAL_OBJECT", &payload);
     let keys = [
         RoutingKey {
             kind: 1,
@@ -193,7 +187,7 @@ fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
         .map(|key| RuntimeObject {
             key: *key,
             mode: ObjectMode::Immutable,
-            format: 0,
+            representation: Representation::Canonical,
             bytes: &payload,
             logical_digest: digest,
         })

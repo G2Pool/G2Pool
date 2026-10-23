@@ -905,11 +905,8 @@ fn native_refresh_keeps_running_acquisitions_pinned_across_restart() {
             } else {
                 ObjectMode::WorkVariant
             },
-            format: 0,
-            logical_digest: blake2::blake2b::blake2b(32, &[], bytes)
-                .as_bytes()
-                .try_into()
-                .unwrap(),
+            representation: crate::storage::sharechain::Representation::Canonical,
+            logical_digest: crate::codec::hash("PHYSICAL_OBJECT", bytes),
             bytes,
         })
         .collect();

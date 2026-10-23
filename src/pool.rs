@@ -1,5 +1,5 @@
 use crate::{
-    codec::Id,
+    codec::{hash, Id},
     objects::{hex, unhex},
     secure_file, Error, Result,
 };
@@ -38,13 +38,10 @@ impl Pool {
         }
     }
     pub fn id(&self, genesis: Id) -> Id {
-        let mut input = [0; 64];
-        input[..32].copy_from_slice(&self.key);
-        input[32..].copy_from_slice(&genesis);
-        blake2::blake2b::blake2b(32, &[], &input)
-            .as_bytes()
-            .try_into()
-            .unwrap()
+        let mut input = Vec::with_capacity(64);
+        input.extend(self.key);
+        input.extend(genesis);
+        hash("POOL_ID", &input)
     }
     pub(crate) fn key(&self) -> [u8; 32] {
         self.key
@@ -94,9 +91,13 @@ impl Pool {
         }
         let pool: Self = serde_json::from_slice(&secure_file::read_regular(path, 16384, true)?)?;
         for network in [ChainTypes::Mainnet, ChainTypes::Testnet] {
-            let mut book = crate::network::peers::Book::memory(false);
-            for peer in pool.peers(network)? {
-                book.seed(peer)?;
+            let seeds = pool
+                .peers(network)?
+                .into_iter()
+                .map(crate::network::peers::validate_seed)
+                .collect::<Result<std::collections::BTreeSet<_>>>()?;
+            if seeds.len() > crate::network::peers::MAX_SEEDS {
+                return Err(Error::Capacity("peer seeds"));
             }
         }
         Ok(pool)

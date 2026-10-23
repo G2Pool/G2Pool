@@ -15,27 +15,93 @@ fn open(path: &std::path::Path) -> SharechainDb {
 }
 
 #[test]
-fn runtime_limits_can_grow_but_cannot_shrink_in_place() {
+fn runtime_limits_are_startup_policy_and_smaller_limits_preserve_retained_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     let original = limits();
-    db.runtime_store(original).unwrap();
-
-    let mut grown = original;
-    grown.max_objects += 1;
-    grown.max_bytes += 1;
-    grown.max_object_bytes += 1;
-    grown.max_lease_keys += 1;
-    grown.max_head_keys += 1;
-    grown.max_heads += 1;
-    db.runtime_store(grown).unwrap();
-
-    let mut shrunk = grown;
-    shrunk.max_heads -= 1;
-    assert!(matches!(
-        db.runtime_store(shrunk),
-        Err(Error::Invalid("runtime limits can only grow"))
-    ));
+    let runtime = db.runtime_store(original).unwrap();
+    runtime
+        .apply(
+            0,
+            RuntimeBatch {
+                objects: &[object(rk(1))],
+                heads: &[RuntimeHead {
+                    id: [1; 32],
+                    binding: [2; 32],
+                    metadata: b"head",
+                    parent: None,
+                    added: &[rk(1)],
+                    removed: &[],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    drop(runtime);
+    let smaller = RuntimeLimits {
+        max_objects: 1,
+        max_bytes: 1000,
+        max_heads: 1,
+        max_head_keys: 1,
+        max_lease_keys: 1,
+        ..original
+    };
+    let runtime = db.runtime_store(smaller).unwrap();
+    assert!(runtime
+        .snapshot()
+        .unwrap()
+        .object(rk(1), None)
+        .unwrap()
+        .is_some());
+    assert!(runtime
+        .apply(
+            1,
+            RuntimeBatch {
+                objects: &[object(rk(2))],
+                ..Default::default()
+            }
+        )
+        .is_err());
+    assert!(runtime
+        .snapshot()
+        .unwrap()
+        .object(rk(2), None)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        runtime
+            .snapshot()
+            .unwrap()
+            .head_keys([1; 32])
+            .unwrap()
+            .unwrap(),
+        vec![rk(1)]
+    );
+    assert!(runtime
+        .db
+        .get(&runtime.env.read_txn().unwrap(), b"LIMITS")
+        .unwrap()
+        .is_none());
+    drop(runtime);
+    let runtime = db.runtime_store(original).unwrap();
+    runtime
+        .apply(
+            2,
+            RuntimeBatch {
+                heads: &[RuntimeHead {
+                    id: [3; 32],
+                    binding: [4; 32],
+                    metadata: b"second",
+                    parent: None,
+                    added: &[rk(1)],
+                    removed: &[],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(db.runtime_store(smaller), Err(Error::Quota(_))));
+    assert_eq!(runtime.snapshot().unwrap().heads(10).unwrap().len(), 2);
 }
 fn rk(n: u8) -> RoutingKey {
     RoutingKey {
@@ -47,7 +113,7 @@ fn object(k: RoutingKey) -> RuntimeObject<'static> {
     RuntimeObject {
         key: k,
         mode: ObjectMode::Immutable,
-        format: 1,
+        representation: Representation::Canonical,
         bytes: b"payload",
         logical_digest: digest(b"payload"),
     }
@@ -100,14 +166,14 @@ fn forks_seals_cas_restart_and_snapshot() {
     let a = RuntimeObject {
         key: w,
         mode: ObjectMode::WorkVariant,
-        format: 2,
+        representation: Representation::Compact,
         bytes: b"work A",
         logical_digest: digest(b"work A"),
     };
     let b = RuntimeObject {
         key: w,
         mode: ObjectMode::WorkVariant,
-        format: 2,
+        representation: Representation::Compact,
         bytes: b"work B",
         logical_digest: digest(b"work B"),
     };
@@ -296,14 +362,14 @@ fn metadata_pages_seek_after_exact_variants_and_cover_filtered_rows() {
                     key: k,
                     mode: ObjectMode::WorkVariant,
                     logical_digest: [0; 32],
-                    format: 1,
+                    representation: Representation::Canonical,
                     bytes: b"A",
                 },
                 RuntimeObject {
                     key: k,
                     mode: ObjectMode::WorkVariant,
                     logical_digest: [0; 32],
-                    format: 2,
+                    representation: Representation::Compact,
                     bytes: b"B",
                 },
                 object(rk(2)),
@@ -327,17 +393,18 @@ fn metadata_pages_seek_after_exact_variants_and_cover_filtered_rows() {
         assert_eq!(page.len(), 1);
         let (route, info) = page[0];
         cursor = Some((route, info.digest));
-        if info.format == 1 {
+        if info.representation == Representation::Compact {
             filtered.push((route, info));
         }
         paged.extend(page);
     }
     assert_eq!(paged, all);
+    assert!(!filtered.is_empty() && filtered.len() < paged.len());
     assert_eq!(
         filtered,
         all.iter()
             .copied()
-            .filter(|(_, info)| info.format == 1)
+            .filter(|(_, info)| info.representation == Representation::Compact)
             .collect::<Vec<_>>()
     );
     assert_eq!(snap.objects_after(1, None, 10, 84).unwrap().len(), 0);
@@ -388,7 +455,7 @@ fn immutable_equivalent_representation_cas_preserves_identity_and_snapshots() {
                 objects: &[RuntimeObject {
                     key: k,
                     mode: ObjectMode::Immutable,
-                    format: 1,
+                    representation: Representation::Compact,
                     bytes: b"changed",
                     logical_digest: digest(b"changed"),
                 }],
@@ -402,8 +469,8 @@ fn immutable_equivalent_representation_cas_preserves_identity_and_snapshots() {
         key: k,
         logical_digest: logical,
         expected_digest: logical,
-        expected_format: 1,
-        format: 2,
+        expected_representation: Representation::Canonical,
+        representation: Representation::Compact,
         bytes: b"packed",
     };
     s.apply(
@@ -415,6 +482,19 @@ fn immutable_equivalent_representation_cas_preserves_identity_and_snapshots() {
     )
     .unwrap();
     assert_eq!(old.object(k, None).unwrap().unwrap().bytes, b"payload");
+    assert_eq!(
+        old.object(k, None).unwrap().unwrap().representation,
+        Representation::Canonical
+    );
+    assert_eq!(
+        s.snapshot()
+            .unwrap()
+            .object(k, None)
+            .unwrap()
+            .unwrap()
+            .representation,
+        Representation::Compact
+    );
     assert_eq!(
         s.snapshot()
             .unwrap()
@@ -432,9 +512,9 @@ fn immutable_equivalent_representation_cas_preserves_identity_and_snapshots() {
                 replacements: &[RuntimeReplacement {
                     key: k,
                     logical_digest: logical,
-                    expected_digest: logical,
-                    expected_format: 1,
-                    format: 3,
+                    expected_digest: digest(b"packed"),
+                    expected_representation: Representation::Canonical,
+                    representation: Representation::Canonical,
                     bytes: b"stale overwrite"
                 }],
                 ..Default::default()
@@ -568,14 +648,14 @@ fn provisional_variant_uses_insertion_order_without_sealing() {
                 RuntimeObject {
                     key: k,
                     mode: ObjectMode::WorkVariant,
-                    format: 1,
+                    representation: Representation::Compact,
                     bytes: b"second by digest",
                     logical_digest: digest(b"second by digest"),
                 },
                 RuntimeObject {
                     key: k,
                     mode: ObjectMode::WorkVariant,
-                    format: 1,
+                    representation: Representation::Compact,
                     bytes: b"last inserted",
                     logical_digest: digest(b"last inserted"),
                 },
@@ -601,14 +681,14 @@ fn released_work_variant_can_be_resealed_after_bounded_reclaim() {
         RuntimeObject {
             key: w,
             mode: ObjectMode::WorkVariant,
-            format: 2,
+            representation: Representation::Compact,
             bytes: b"work A",
             logical_digest: digest(b"work A"),
         },
         RuntimeObject {
             key: w,
             mode: ObjectMode::WorkVariant,
-            format: 2,
+            representation: Representation::Compact,
             bytes: b"work B",
             logical_digest: digest(b"work B"),
         },
@@ -925,14 +1005,11 @@ impl RuntimeReader<'_> {
             if value.len() != 40 {
                 return Err(Error::Invalid("runtime head"));
             }
-            if self.store.trie.contains(
-                self.txn,
-                &value[8..].try_into().unwrap(),
-                DependencyKey {
-                    kind: k.kind,
-                    id: k.id,
-                },
-            )? {
+            if self
+                .store
+                .trie
+                .contains(self.txn, &value[8..].try_into().unwrap(), k)?
+            {
                 count += 1;
             }
         }
@@ -1252,4 +1329,75 @@ fn released_head_objects_receive_a_serving_grace_after_trie_gc() {
         .object(rk(2), None)
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn startup_lease_limits_count_only_active_memberships_across_all_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let runtime = db.runtime_store(limits()).unwrap();
+    runtime
+        .apply(
+            0,
+            RuntimeBatch {
+                leases: &[RuntimeLease {
+                    id: [9; 32],
+                    keys: &[rk(1), rk(2)],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let smaller = RuntimeLimits {
+        max_lease_keys: 1,
+        ..limits()
+    };
+    assert!(db.runtime_store(smaller).is_ok());
+    runtime
+        .apply(
+            chrono::Utc::now().timestamp() as u64,
+            RuntimeBatch {
+                leases: &[RuntimeLease {
+                    id: [9; 32],
+                    keys: &[rk(1), rk(2)],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(db.runtime_store(smaller), Err(Error::Quota(_))));
+    runtime
+        .apply(
+            chrono::Utc::now().timestamp() as u64,
+            RuntimeBatch {
+                leases: &[RuntimeLease {
+                    id: [8; 32],
+                    keys: &[rk(1), rk(3)],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        db.runtime_store(RuntimeLimits {
+            max_lease_keys: 3,
+            ..limits()
+        }),
+        Err(Error::Quota(_))
+    ));
+    let runtime = db
+        .runtime_store(RuntimeLimits {
+            max_lease_keys: 4,
+            ..limits()
+        })
+        .unwrap();
+    runtime
+        .apply(
+            chrono::Utc::now().timestamp() as u64,
+            RuntimeBatch {
+                objects: &[object(rk(4))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
 }
