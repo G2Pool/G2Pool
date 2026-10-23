@@ -147,9 +147,7 @@ fn malformed_routing_rows_do_not_recreate_wallet_state() {
     let mut store =
         crate::storage::Store::open(&path, [1; 32], crate::storage::StorageLimits::default())
             .unwrap();
-    store
-        .save_wallet_record("sentinel", b"financial state")
-        .unwrap();
+    store.bind_wallet([7; 33]).unwrap();
     drop(store);
     let sharechain = crate::storage::sharechain::SharechainDb::open(
         &path.with_extension("sharechain"),
@@ -171,10 +169,7 @@ fn malformed_routing_rows_do_not_recreate_wallet_state() {
     let store =
         crate::storage::Store::open(&path, [1; 32], crate::storage::StorageLimits::default())
             .unwrap();
-    assert_eq!(
-        store.wallet_record("sentinel").unwrap().unwrap(),
-        b"financial state"
-    );
+    assert_eq!(store.wallet_account().unwrap(), Some([7; 33]));
 }
 #[test]
 fn reachability_does_not_make_a_sparse_peer_a_productive_gossip_source() {

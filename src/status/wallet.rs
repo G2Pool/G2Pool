@@ -14,7 +14,6 @@ pub struct Snapshot {
     pub updated_at: i64,
     pub state: String,
     pub scanned_pmmr_position: u64,
-    pub native_pmmr_size: u64,
     pub balance: Option<grin_wallet_libwallet::WalletInfo>,
     pub output_count: usize,
     pub error: Option<String>,
@@ -23,14 +22,14 @@ pub struct Snapshot {
 pub fn snapshot(
     account: &[u8; 33],
     pool_id: &[u8; 32],
-    head: Option<(u64, [u8; 32], u64)>,
+    head: Option<(u64, [u8; 32])>,
     scanned_pmmr_position: u64,
     state: &str,
     balance: Option<(grin_wallet_libwallet::WalletInfo, usize)>,
     error: Option<String>,
 ) -> Snapshot {
-    let (native_height, native_head, native_pmmr_size) = head
-        .map(|(height, hash, pmmr)| (height, hex(&hash), pmmr))
+    let (native_height, native_head) = head
+        .map(|(height, hash)| (height, hex(&hash)))
         .unwrap_or_default();
     let (balance, output_count) =
         balance.map_or((None, 0), |(balance, count)| (Some(balance), count));
@@ -42,7 +41,6 @@ pub fn snapshot(
         updated_at: chrono::Utc::now().timestamp(),
         state: state.into(),
         scanned_pmmr_position,
-        native_pmmr_size,
         balance,
         output_count,
         error,

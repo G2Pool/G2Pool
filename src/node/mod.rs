@@ -435,7 +435,7 @@ impl Node {
         for task in self.tasks.values() {
             keep.extend(task.leased.iter().copied());
         }
-        for bytes in self.store.wallet_registrations()? {
+        if let Some(bytes) = self.store.wallet_registration()? {
             let registration: Registration = decode(&bytes)?;
             keep.insert(Key::new(Kind::Registration, id(&registration)?));
             let key = Key::new(Kind::Inventory, registration.fields.inventory);

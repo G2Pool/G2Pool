@@ -282,7 +282,7 @@ pub fn run(config: Config) -> Result<()> {
         profile.pool_id,
         config.storage.clone(),
     )?;
-    if !wallet_existed && store.wallet_record("account")?.is_some() {
+    if !wallet_existed && store.wallet_account()?.is_some() {
         return Err(Error::Invalid(
             "Grin wallet seed missing from established pool data; refusing to generate a replacement",
         ));

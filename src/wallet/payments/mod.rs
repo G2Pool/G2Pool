@@ -9,7 +9,7 @@ use grin_wallet_impls::{DefaultLCProvider, DefaultWalletImpl};
 use grin_wallet_libwallet::{InitTxArgs, NodeClient, SlateState, WalletInst};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -20,6 +20,10 @@ mod worker;
 pub use direct::DirectNodeClient;
 pub use worker::{PaymentWorker, WorkerAction};
 
+pub(crate) const MAX_SLATEPACK_BYTES: usize = 2_000_000;
+const MAX_INTENT_BYTES: u64 = (2 * 6 * MAX_SLATEPACK_BYTES + 1024) as u64;
+const MAX_STORED_TX_BYTES: u64 = 2_000_000;
+
 pub type Wallet<C> =
     Arc<Mutex<Box<dyn WalletInst<'static, DefaultLCProvider<C, ExtKeychain>, C, ExtKeychain>>>>;
 pub type DaemonPayments = Payments<crate::wallet::payments::DirectNodeClient>;
@@ -29,22 +33,39 @@ pub struct Payments<C: NodeClient + 'static> {
     pub mask: Option<SecretKey>,
     directory: PathBuf,
     account: [u8; 33],
-    _lock: File,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Phase {
+    Locking,
+    AwaitingResponse,
+    Finalizing,
+    ReadyToPost,
 }
 #[derive(Serialize, Deserialize)]
 struct Intent {
     id: String,
     amount: u64,
-    stage: String,
+    stage: Phase,
     outgoing: String,
     finalized: Option<String>,
     response: Option<String>,
 }
-fn private_read(path: &Path, max: u64) -> Result<Vec<u8>> {
-    regular_read(path, max, true)
+impl Intent {
+    fn check_size(&self) -> Result<()> {
+        if self.outgoing.len() > MAX_SLATEPACK_BYTES
+            || self
+                .response
+                .as_ref()
+                .is_some_and(|response| response.len() > MAX_SLATEPACK_BYTES)
+        {
+            bail!("payment Slatepack is too large");
+        }
+        Ok(())
+    }
 }
-fn regular_read(path: &Path, max: u64, private: bool) -> Result<Vec<u8>> {
-    crate::secure_file::read_regular(path, max, private).map_err(|e| anyhow!(e.to_string()))
+fn private_read(path: &Path, max: u64) -> Result<Vec<u8>> {
+    crate::secure_file::read_regular(path, max, true).map_err(|e| anyhow!(e.to_string()))
 }
 fn write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     crate::secure_file::publish_atomic(path, bytes, replace).map_err(|e| anyhow!(e.to_string()))
@@ -68,15 +89,6 @@ impl<C: NodeClient + 'static> Payments<C> {
             use std::os::unix::fs::PermissionsExt;
             fs::Permissions::from_mode(0o700)
         })?;
-        let mut lock_options = OpenOptions::new();
-        lock_options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let lock = lock_options.open(directory.join("payments.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).context("payments backend already in use")?;
         let mut wallet = Box::new(DefaultWalletImpl::<C>::new(client)?)
             as Box<dyn WalletInst<'static, DefaultLCProvider<C, ExtKeychain>, C, ExtKeychain>>;
         let lc = wallet.lc_provider()?;
@@ -85,9 +97,7 @@ impl<C: NodeClient + 'static> Payments<C> {
             if lc.wallet_exists(None)? {
                 bail!("Grin wallet already exists");
             }
-            if fs::read_dir(&directory)?
-                .any(|entry| entry.map_or(true, |entry| entry.file_name() != "payments.lock"))
-            {
+            if fs::read_dir(&directory)?.next().is_some() {
                 bail!("refusing to create a new seed in an existing wallet directory");
             }
             lc.create_wallet(None, None, 32, ZeroingString::from(""), false)?;
@@ -118,7 +128,6 @@ impl<C: NodeClient + 'static> Payments<C> {
             mask,
             directory,
             account,
-            _lock: lock,
         })
     }
     pub fn signer(&self) -> Result<super::Signer> {
@@ -154,6 +163,9 @@ impl<C: NodeClient + 'static> Payments<C> {
         if !updated {
             bail!("wallet refresh could not validate the native chain");
         }
+        Ok(())
+    }
+    pub(super) fn rebroadcast(&self) -> Result<()> {
         let (_, pending) = self.owner.retrieve_txs(
             self.mask.as_ref(),
             false,
@@ -165,23 +177,49 @@ impl<C: NodeClient + 'static> Payments<C> {
                 ..Default::default()
             }),
         )?;
+        let mut first_error = None;
         for entry in pending {
             if !matches!(
                 entry.tx_type,
                 grin_wallet_libwallet::TxLogEntryType::TxSent
                     | grin_wallet_libwallet::TxLogEntryType::TxReverted
-            ) || entry.tx_slate_state != Some(SlateState::Standard3)
-            {
+            ) {
                 continue;
             }
-            let id = entry
-                .tx_slate_id
-                .context("signed Grin transaction has no slate ID")?;
-            self.check_stored_encoding(&id.to_string())?;
-            let slate = self
-                .owner
-                .get_stored_tx(self.mask.as_ref(), None, Some(&id))?
-                .context("signed Grin transaction is missing")?;
+            if let Err(error) = self.rebroadcast_entry(entry) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+    fn rebroadcast_entry(&self, mut entry: grin_wallet_libwallet::TxLogEntry) -> Result<()> {
+        let id = entry
+            .tx_slate_id
+            .context("signed Grin transaction has no slate ID")?;
+        let Some(slate) = self.stored_transaction(&id.to_string())? else {
+            if entry.tx_slate_state == Some(SlateState::Standard3) {
+                bail!("signed Grin transaction is missing");
+            }
+            return Ok(());
+        };
+        if is_signed(&slate) {
+            let excess = slate.tx_or_err()?.kernels()[0].excess;
+            if entry.kernel_excess != Some(excess)
+                || entry.tx_slate_state != Some(SlateState::Standard3)
+            {
+                entry.kernel_excess = Some(excess);
+                entry.tx_slate_state = Some(SlateState::Standard3);
+                let parent = entry.parent_key_id.clone();
+                let mut wallet = self.wallet.lock();
+                let backend = wallet.lc_provider()?.wallet_inst()?;
+                let mut batch = backend.batch(self.mask.as_ref())?;
+                batch.save_tx_log_entry(entry, &parent)?;
+                batch.delete_private_context(id.as_bytes())?;
+                batch.commit()?;
+            }
             self.owner.post_tx(self.mask.as_ref(), &slate, false)?;
         }
         Ok(())
@@ -198,7 +236,6 @@ impl<C: NodeClient + 'static> Payments<C> {
     }
     pub(super) fn status_snapshot(
         &self,
-        chain: &grin_chain::Chain,
         profile: [u8; 32],
         state: &str,
         error: Option<String>,
@@ -211,12 +248,7 @@ impl<C: NodeClient + 'static> Payments<C> {
             None
         } else {
             let hash = grin_core::core::hash::Hash::from_hex(&scanned.hash)?;
-            let header = chain.get_block_header(&hash)?;
-            Some((
-                scanned.height,
-                crate::native::hash_bytes(hash),
-                header.output_mmr_size,
-            ))
+            Some((scanned.height, crate::native::hash_bytes(hash)))
         };
         if state != "ready" {
             return Ok(crate::status::wallet::snapshot(
@@ -246,12 +278,20 @@ impl<C: NodeClient + 'static> Payments<C> {
             error,
         ))
     }
-    fn check_stored_encoding(&self, id: &str) -> Result<()> {
+    fn stored_transaction(&self, id: &str) -> Result<Option<grin_wallet_libwallet::Slate>> {
+        let id = id.parse()?;
         let path = self
             .directory
             .join("wallet_data/saved_txs")
             .join(format!("{id}.grintx"));
-        let hex = String::from_utf8(regular_read(&path, 2_000_000, false)?)?;
+        let bytes = match crate::secure_file::read_regular(&path, MAX_STORED_TX_BYTES, false) {
+            Ok(bytes) => bytes,
+            Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let hex = String::from_utf8(bytes)?;
         let bytes = grin_util::from_hex(&hex)
             .map_err(|_| anyhow!("invalid stored native transaction encoding"))?;
         let tx: grin_core::core::Transaction = grin_core::ser::deserialize(
@@ -262,9 +302,21 @@ impl<C: NodeClient + 'static> Payments<C> {
         if tx.kernels().len() != 1 || tx.aggregate_fee_fields().is_err() {
             bail!("invalid stored native transaction structure");
         }
+        Ok(self
+            .owner
+            .get_stored_tx(self.mask.as_ref(), None, Some(&id))?)
+    }
+    fn require_signing_context(&self, slate: &grin_wallet_libwallet::Slate) -> Result<()> {
+        let mut wallet = self.wallet.lock();
+        wallet
+            .lc_provider()?
+            .wallet_inst()?
+            .get_private_context(self.mask.as_ref(), slate.id.as_bytes())
+            .context("SDK signing context unavailable; withdrawal preserved")?;
         Ok(())
     }
     fn save(&self, i: &Intent) -> Result<()> {
+        i.check_size()?;
         write_private(
             &self.directory.join("intent.json"),
             &serde_json::to_vec(i)?,
@@ -272,10 +324,11 @@ impl<C: NodeClient + 'static> Payments<C> {
         )
     }
     fn load(&self) -> Result<Intent> {
-        self.load_path(&self.directory.join("intent.json"))
-    }
-    fn load_path(&self, path: &Path) -> Result<Intent> {
-        let i: Intent = serde_json::from_slice(&private_read(path, 2_000_000)?)?;
+        let i: Intent = serde_json::from_slice(&private_read(
+            &self.directory.join("intent.json"),
+            MAX_INTENT_BYTES,
+        )?)?;
+        i.check_size()?;
         let original = self.owner.slate_from_slatepack_message(
             self.mask.as_ref(),
             i.outgoing.clone(),
@@ -284,14 +337,6 @@ impl<C: NodeClient + 'static> Payments<C> {
         if original.id.to_string() != i.id
             || original.amount != i.amount
             || original.state != SlateState::Standard1
-            || ![
-                "locking",
-                "awaiting-response",
-                "finalizing",
-                "ready-to-post",
-                "posted",
-            ]
-            .contains(&i.stage.as_str())
         {
             bail!("invalid payment intent");
         }
@@ -305,7 +350,7 @@ impl<C: NodeClient + 'static> Payments<C> {
             return Ok(serde_json::json!({"state": "idle"}));
         }
         let intent = self.load()?;
-        if ["locking", "awaiting-response"].contains(&intent.stage.as_str()) {
+        if matches!(intent.stage, Phase::Locking | Phase::AwaitingResponse) {
             let slatepack = self.offer(intent.amount)?;
             return Ok(
                 serde_json::json!({"state": "awaiting_response", "amount": intent.amount, "slatepack": slatepack}),
@@ -321,12 +366,10 @@ impl<C: NodeClient + 'static> Payments<C> {
         check_amount(amount)?;
         if self.directory.join("intent.json").exists() {
             let mut previous = self.load()?;
-            if previous.stage == "posted" {
-                self.archive(&previous)?;
-            } else if previous.amount == amount
-                && ["locking", "awaiting-response"].contains(&previous.stage.as_str())
+            if previous.amount == amount
+                && matches!(previous.stage, Phase::Locking | Phase::AwaitingResponse)
             {
-                if previous.stage == "locking" {
+                if previous.stage == Phase::Locking {
                     let original = self.owner.slate_from_slatepack_message(
                         self.mask.as_ref(),
                         previous.outgoing.clone(),
@@ -342,7 +385,7 @@ impl<C: NodeClient + 'static> Payments<C> {
                     if txs.is_empty() {
                         self.owner.tx_lock_outputs(self.mask.as_ref(), &original)?;
                     }
-                    previous.stage = "awaiting-response".into();
+                    previous.stage = Phase::AwaitingResponse;
                     self.save(&previous)?;
                 }
                 return Ok(previous.outgoing);
@@ -385,20 +428,19 @@ impl<C: NodeClient + 'static> Payments<C> {
         let mut i = Intent {
             id: slate.id.to_string(),
             amount,
-            stage: "locking".into(),
+            stage: Phase::Locking,
             outgoing,
             finalized: None,
             response: None,
         };
         self.save(&i)?;
         self.owner.tx_lock_outputs(self.mask.as_ref(), &slate)?;
-        i.stage = "awaiting-response".into();
+        i.stage = Phase::AwaitingResponse;
         self.save(&i)?;
         Ok(i.outgoing)
     }
-    fn archive(&self, i: &Intent) -> Result<()> {
-        let archived = self.directory.join(format!("{}.posted.json", i.id));
-        fs::rename(self.directory.join("intent.json"), archived)?;
+    fn clear_intent(&self) -> Result<()> {
+        fs::remove_file(self.directory.join("intent.json"))?;
         crate::secure_file::sync_directory(&self.directory)?;
         Ok(())
     }
@@ -441,7 +483,7 @@ impl<C: NodeClient + 'static> Payments<C> {
         response: &str,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
-        if response.len() > 2_000_000 {
+        if response.len() > MAX_SLATEPACK_BYTES {
             bail!("response Slatepack is too large");
         }
         if !self.directory.join("intent.json").exists() {
@@ -459,9 +501,22 @@ impl<C: NodeClient + 'static> Payments<C> {
                 packed.clone(),
                 vec![],
             )?;
-            let completed =
-                self.load_path(&self.directory.join(format!("{}.posted.json", slate.id)))?;
-            if completed.stage == "posted" && completed.response.as_ref() == Some(&packed) {
+            let (_, txs) =
+                self.owner
+                    .retrieve_txs(self.mask.as_ref(), false, None, Some(slate.id), None)?;
+            if slate.state == SlateState::Standard2
+                && txs.iter().any(|tx| {
+                    matches!(
+                        tx.tx_type,
+                        grin_wallet_libwallet::TxLogEntryType::TxSent
+                            | grin_wallet_libwallet::TxLogEntryType::TxReverted
+                    )
+                })
+                && self
+                    .stored_transaction(&slate.id.to_string())?
+                    .as_ref()
+                    .is_some_and(is_signed)
+            {
                 return Ok(());
             }
             bail!("response does not match a completed payment");
@@ -472,159 +527,134 @@ impl<C: NodeClient + 'static> Payments<C> {
                 bail!("supplied response differs from the saved payment response");
             }
         }
-        if i.stage == "posted" {
-            let packed = response.to_owned();
-            if i.response.as_ref() != Some(&packed) {
-                bail!("response does not match completed payment");
-            }
-            self.archive(&i)?;
-            return Ok(());
-        }
-        let result = (|| {
-            let slate = if i.finalized.is_some() {
-                let original = self.owner.slate_from_slatepack_message(
-                    self.mask.as_ref(),
-                    i.outgoing.clone(),
-                    vec![],
-                )?;
-                self.check_stored_encoding(&i.id)?;
-                self.owner
-                    .get_stored_tx(self.mask.as_ref(), None, Some(&original.id))?
-                    .context("finalized SDK transaction is missing")?
+        let slate = if i.finalized.is_some() {
+            self.stored_transaction(&i.id)?
+                .context("finalized SDK transaction is missing")?
+        } else {
+            let packed = if let Some(ref saved) = i.response {
+                saved.clone()
             } else {
-                let packed = if let Some(ref saved) = i.response {
-                    saved.clone()
-                } else {
-                    response.to_owned()
-                };
-                if self
-                    .owner
-                    .decode_slatepack_message(self.mask.as_ref(), packed.clone(), vec![])?
-                    .mode
-                    != 0
-                {
-                    bail!("only plaintext manual Slatepacks are supported");
-                }
-                let slate = self.owner.slate_from_slatepack_message(
+                response.to_owned()
+            };
+            if self
+                .owner
+                .decode_slatepack_message(self.mask.as_ref(), packed.clone(), vec![])?
+                .mode
+                != 0
+            {
+                bail!("only plaintext manual Slatepacks are supported");
+            }
+            let slate = self.owner.slate_from_slatepack_message(
+                self.mask.as_ref(),
+                packed.clone(),
+                vec![],
+            )?;
+            let original = self.owner.slate_from_slatepack_message(
+                self.mask.as_ref(),
+                i.outgoing.clone(),
+                vec![],
+            )?;
+            if slate.id.to_string() != i.id
+                || slate.state != SlateState::Standard2
+                || (slate.amount != 0 && slate.amount != i.amount)
+                || (slate.fee_fields.fee() != 0 && slate.fee_fields != original.fee_fields)
+                || slate.num_participants != original.num_participants
+                || slate.ttl_cutoff_height != original.ttl_cutoff_height
+            {
+                bail!("response does not match pending payment");
+            }
+            if i.stage == Phase::Locking {
+                let (_, txs) = self.owner.retrieve_txs(
                     self.mask.as_ref(),
-                    packed.clone(),
-                    vec![],
+                    false,
+                    None,
+                    Some(original.id),
+                    None,
                 )?;
-                let original = self.owner.slate_from_slatepack_message(
-                    self.mask.as_ref(),
-                    i.outgoing.clone(),
-                    vec![],
-                )?;
-                if slate.id.to_string() != i.id
-                    || slate.state != SlateState::Standard2
-                    || (slate.amount != 0 && slate.amount != i.amount)
-                    || (slate.fee_fields.fee() != 0 && slate.fee_fields != original.fee_fields)
-                    || slate.num_participants != original.num_participants
-                    || slate.ttl_cutoff_height != original.ttl_cutoff_height
-                {
-                    bail!("response does not match pending payment");
+                if txs.is_empty() {
+                    self.owner.tx_lock_outputs(self.mask.as_ref(), &original)?;
                 }
-                if i.stage == "locking" {
-                    let (_, txs) = self.owner.retrieve_txs(
-                        self.mask.as_ref(),
-                        false,
-                        None,
-                        Some(original.id),
-                        None,
-                    )?;
-                    if txs.is_empty() {
-                        self.owner.tx_lock_outputs(self.mask.as_ref(), &original)?;
+            }
+            if i.response.is_none() && matches!(i.stage, Phase::Locking | Phase::AwaitingResponse) {
+                Self::check_response(&slate, &original)?;
+            }
+            let recovered = if i.stage == Phase::Finalizing {
+                match self.stored_transaction(&i.id) {
+                    Ok(Some(stored)) if is_signed(&stored) => Some(stored),
+                    Err(error) if error.downcast_ref::<crate::Error>().is_some() => {
+                        return Err(error)
+                    }
+                    _ => {
+                        self.require_signing_context(&slate)?;
+                        None
                     }
                 }
-                if i.response.is_none()
-                    && ["locking", "awaiting-response"].contains(&i.stage.as_str())
-                {
-                    Self::check_response(&slate, &original)?;
-                }
-                let stored = if i.stage == "finalizing" {
-                    self.check_stored_encoding(&i.id)?;
-                    self.owner
-                        .get_stored_tx(self.mask.as_ref(), None, Some(&original.id))?
-                } else {
-                    None
-                };
-                let recovered = stored.filter(|s| {
-                    s.tx.as_ref()
-                        .map(|tx| {
-                            tx.validate(grin_core::core::Weighting::AsTransaction)
-                                .is_ok()
-                        })
-                        .unwrap_or(false)
-                });
-                if i.response.is_none() && cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                    bail!("withdrawal cancelled before signing");
-                }
-                i.response = Some(packed);
-                i.stage = "finalizing".into();
-                self.save(&i)?;
-                let finalized = if let Some(s) = recovered {
-                    s
-                } else {
-                    match self.owner.finalize_tx(self.mask.as_ref(), &slate) {
-                        Ok(signed) => signed,
-                        Err(error) => match self.cancel() {
-                            Ok(_) => bail!("Grin rejected the reply; unsigned withdrawal cancelled: {error}"),
-                            Err(cancel_error) => bail!("finalization failed; withdrawal preserved for retry: {error}; {cancel_error}"),
-                        },
-                    }
-                };
-                i.finalized = Some(
-                    finalized
-                        .tx
-                        .as_ref()
-                        .context("finalized SDK transaction missing")?
-                        .hash()
-                        .to_hex(),
-                );
-                i.stage = "ready-to-post".into();
-                self.save(&i)?;
-                finalized
+            } else {
+                None
             };
-            if slate.id.to_string() != i.id || slate.state != SlateState::Standard3 {
-                bail!("invalid finalized payment");
+            if i.response.is_none() && cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                bail!("withdrawal cancelled before signing");
             }
-            let tx = slate
-                .tx
-                .as_ref()
-                .context("finalized payment has no transaction")?;
-            tx.validate(grin_core::core::Weighting::AsTransaction)?;
-            if i.finalized.as_ref() != Some(&tx.hash().to_hex()) {
-                bail!("stored finalized transaction does not match payment intent");
-            }
-            if tx.kernels().len() != 1 {
-                bail!("payment must have exactly one kernel");
-            }
-            let already_on_chain = {
-                let mut lock = self.wallet.lock();
-                let backend = lock.lc_provider()?.wallet_inst()?;
-                backend
-                    .w2n_client()
-                    .get_kernel(&tx.kernels()[0].excess, None, None)?
-                    .is_some()
-            };
-            if !already_on_chain {
-                self.owner.post_tx(self.mask.as_ref(), &slate, false)?;
-            }
-            i.stage = "posted".into();
+            i.response = Some(packed);
+            i.stage = Phase::Finalizing;
             self.save(&i)?;
-            self.archive(&i)?;
-            Ok(())
-        })();
-        result
+            let finalized = if let Some(s) = recovered {
+                s
+            } else {
+                match self.owner.finalize_tx(self.mask.as_ref(), &slate) {
+                    Ok(signed) => signed,
+                    Err(error) => match self.cancel() {
+                        Ok(_) => bail!("Grin rejected the reply; unsigned withdrawal cancelled: {error}"),
+                        Err(cancel_error) => bail!("finalization failed; withdrawal preserved for retry: {error}; {cancel_error}"),
+                    },
+                }
+            };
+            i.finalized = Some(
+                finalized
+                    .tx
+                    .as_ref()
+                    .context("finalized SDK transaction missing")?
+                    .hash()
+                    .to_hex(),
+            );
+            i.stage = Phase::ReadyToPost;
+            self.save(&i)?;
+            finalized
+        };
+        if slate.id.to_string() != i.id || slate.state != SlateState::Standard3 {
+            bail!("invalid finalized payment");
+        }
+        let tx = slate
+            .tx
+            .as_ref()
+            .context("finalized payment has no transaction")?;
+        tx.validate(grin_core::core::Weighting::AsTransaction)?;
+        if i.finalized.as_ref() != Some(&tx.hash().to_hex()) {
+            bail!("stored finalized transaction does not match payment intent");
+        }
+        if tx.kernels().len() != 1 {
+            bail!("payment must have exactly one kernel");
+        }
+        let already_on_chain = {
+            let mut lock = self.wallet.lock();
+            let backend = lock.lc_provider()?.wallet_inst()?;
+            backend
+                .w2n_client()
+                .get_kernel(&tx.kernels()[0].excess, None, None)?
+                .is_some()
+        };
+        if !already_on_chain {
+            self.owner.post_tx(self.mask.as_ref(), &slate, false)?;
+        }
+        self.clear_intent()?;
+        Ok(())
     }
     pub fn cancel(&self) -> Result<bool> {
         if !self.directory.join("intent.json").exists() {
             return Ok(false);
         }
         let i = self.load()?;
-        if !["locking", "awaiting-response", "finalizing"].contains(&i.stage.as_str())
-            || i.finalized.is_some()
-        {
+        if i.stage == Phase::ReadyToPost || i.finalized.is_some() {
             bail!("cannot cancel a payment after finalization began");
         }
         let original = self.owner.slate_from_slatepack_message(
@@ -635,28 +665,22 @@ impl<C: NodeClient + 'static> Payments<C> {
         let (_, txs) =
             self.owner
                 .retrieve_txs(self.mask.as_ref(), false, None, Some(original.id), None)?;
-        if !txs.is_empty() {
-            self.check_stored_encoding(&i.id)?;
-            if let Some(stored) =
-                self.owner
-                    .get_stored_tx(self.mask.as_ref(), None, Some(&original.id))?
-            {
-                if stored
-                    .tx
-                    .as_ref()
-                    .map(|tx| {
-                        tx.validate(grin_core::core::Weighting::AsTransaction)
-                            .is_ok()
-                    })
-                    .unwrap_or(false)
-                {
-                    bail!("cannot cancel a signed payment");
-                }
+        if i.response.is_some()
+            && (txs.is_empty()
+                || !txs
+                    .iter()
+                    .all(|tx| tx.tx_type == grin_wallet_libwallet::TxLogEntryType::TxSentCancelled))
+        {
+            match self.stored_transaction(&i.id) {
+                Ok(Some(stored)) if is_signed(&stored) => bail!("cannot cancel a signed payment"),
+                Ok(Some(_)) => {}
+                Err(error) if error.downcast_ref::<crate::Error>().is_some() => return Err(error),
+                _ => self.require_signing_context(&original)?,
             }
         }
         if txs
             .iter()
-            .any(|t| t.tx_type != grin_wallet_libwallet::TxLogEntryType::TxSentCancelled)
+            .any(|tx| tx.tx_type != grin_wallet_libwallet::TxLogEntryType::TxSentCancelled)
         {
             self.owner
                 .cancel_tx(self.mask.as_ref(), None, Some(original.id))?;
@@ -668,21 +692,15 @@ impl<C: NodeClient + 'static> Payments<C> {
             batch.delete_private_context(original.id.as_bytes())?;
             batch.commit()?;
         }
-        let archived = self.directory.join(format!("{}.cancelled.json", i.id));
-        if archived.exists() {
-            if private_read(&archived, 2_000_000)?
-                != private_read(&self.directory.join("intent.json"), 2_000_000)?
-            {
-                bail!("cancelled archive mismatch");
-            }
-        } else {
-            fs::hard_link(self.directory.join("intent.json"), &archived)?;
-        }
-        crate::secure_file::sync_directory(&self.directory)?;
-        fs::remove_file(self.directory.join("intent.json"))?;
-        crate::secure_file::sync_directory(&self.directory)?;
+        self.clear_intent()?;
         Ok(true)
     }
+}
+fn is_signed(slate: &grin_wallet_libwallet::Slate) -> bool {
+    slate.tx.as_ref().is_some_and(|tx| {
+        tx.validate(grin_core::core::Weighting::AsTransaction)
+            .is_ok()
+    })
 }
 fn check_payment_weight(inputs: u64, change_outputs: u64) -> Result<()> {
     let outputs = change_outputs

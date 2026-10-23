@@ -1,4 +1,4 @@
-use crate::wallet::payments::parse_amount;
+use crate::wallet::payments::{parse_amount, MAX_SLATEPACK_BYTES};
 use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{
@@ -10,7 +10,7 @@ use crossterm::{
 };
 use std::{
     collections::VecDeque,
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     time::Duration,
 };
 pub fn run(data: &std::path::Path) -> Result<String> {
@@ -67,9 +67,11 @@ pub fn run(data: &std::path::Path) -> Result<String> {
             }
             .into());
         };
+        if !response.is_empty() {
+            response.push('\n');
+        }
         response.push_str(value.trim());
-        response.push('\n');
-        if response.len() > 2_000_000 {
+        if response.len() > MAX_SLATEPACK_BYTES {
             bail!("reply Slatepack is too large");
         }
         if value.trim().ends_with("ENDSLATEPACK.") {
@@ -138,11 +140,21 @@ impl Input {
     fn line(&mut self, cancelled: &std::sync::atomic::AtomicBool) -> Result<Option<String>> {
         if !io::stdin().is_terminal() {
             let mut line = String::new();
-            let count = io::stdin().read_line(&mut line)?;
+            let count = io::stdin()
+                .lock()
+                .take((MAX_SLATEPACK_BYTES + 3) as u64)
+                .read_line(&mut line)?;
+            if count > MAX_SLATEPACK_BYTES + 2 {
+                bail!("input is too large");
+            }
             if count == 0 {
                 return Ok(None);
             }
-            return Ok(Some(line.trim_end_matches(['\r', '\n']).to_owned()));
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.len() > MAX_SLATEPACK_BYTES {
+                bail!("input is too large");
+            }
+            return Ok(Some(line.to_owned()));
         }
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -176,7 +188,7 @@ impl Input {
                     continue;
                 }
                 line.push(character);
-                if line.len() > 2_000_000 {
+                if line.len() > MAX_SLATEPACK_BYTES {
                     bail!("input is too large");
                 }
                 write!(stdout, "{character}")?;
@@ -210,6 +222,9 @@ impl Input {
                     }
                     KeyCode::Char(character) => {
                         line.push(character);
+                        if line.len() > MAX_SLATEPACK_BYTES {
+                            bail!("input is too large");
+                        }
                         write!(stdout, "{character}")?;
                         stdout.flush()?;
                     }

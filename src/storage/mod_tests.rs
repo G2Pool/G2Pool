@@ -185,16 +185,6 @@ fn winning_disconnected_head_replaces_only_the_incumbent_at_capacity() {
     assert_eq!(store.read(object.key).unwrap(), object.bytes);
 }
 
-impl Store {
-    pub fn save_wallet_record(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > 256 * 1024 {
-            return Err(Error::Capacity("wallet record"));
-        }
-        self.database
-            .auxiliary_write(format!("aux/wallet/record/{name}").as_bytes(), bytes)
-            .map_err(runtime_error)
-    }
-}
 
 impl Store {
     pub(crate) fn stage(&mut self, objects: &[Object]) -> Result<()> {

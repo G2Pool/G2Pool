@@ -224,10 +224,40 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
     )
     .unwrap();
     sender.refresh().unwrap();
-    let before = sender
-        .status_snapshot(&chain, [7; 32], "ready", None)
-        .unwrap();
+    let before = sender.status_snapshot([7; 32], "ready", None).unwrap();
     assert!(before.balance.unwrap().amount_currently_spendable > 0);
+    let offer = sender.offer(1_000_000_000).unwrap();
+    let offer_slate = sender
+        .owner
+        .slate_from_slatepack_message(sender.mask.as_ref(), offer, vec![])
+        .unwrap();
+    let mut intent = sender.load().unwrap();
+    intent.response = Some("\0".repeat(super::MAX_SLATEPACK_BYTES));
+    sender.save(&intent).unwrap();
+    assert_eq!(
+        sender.load().unwrap().response.unwrap().len(),
+        super::MAX_SLATEPACK_BYTES
+    );
+    intent.response.as_mut().unwrap().push('\0');
+    assert!(sender.save(&intent).is_err());
+    intent.response = None;
+    sender.save(&intent).unwrap();
+    let partial_path = sender
+        .directory
+        .join("wallet_data/saved_txs")
+        .join(format!("{}.grintx", offer_slate.id));
+    let partial = std::fs::read(&partial_path).unwrap();
+    std::fs::remove_file(&partial_path).unwrap();
+    sender.refresh().unwrap();
+    sender.rebroadcast().unwrap();
+    std::fs::write(&partial_path, b"invalid encoding").unwrap();
+    sender.refresh().unwrap();
+    assert!(sender.rebroadcast().is_err());
+    std::fs::write(&partial_path, partial).unwrap();
+    std::fs::remove_file(&partial_path).unwrap();
+    assert!(sender.cancel().unwrap());
+    assert!(!sender.directory.join("intent.json").exists());
+    sender.refresh().unwrap();
     let offer = sender.offer(1_000_000_000).unwrap();
     let offer_slate = sender
         .owner
@@ -263,12 +293,68 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         .unwrap();
     let mut intent = sender.load().unwrap();
     intent.response = Some(packed.clone());
-    intent.stage = "finalizing".into();
+    intent.stage = super::Phase::Finalizing;
     sender.save(&intent).unwrap();
+    let stored_path = sender
+        .directory
+        .join("wallet_data/saved_txs")
+        .join(format!("{}.grintx", reply.id));
+    std::fs::write(&stored_path, b"interrupted native transaction write").unwrap();
+    sender.finalize(&packed, &AtomicBool::new(false)).unwrap();
+    let first_signed_path = stored_path;
+    let (_, entries) = sender
+        .owner
+        .retrieve_txs(sender.mask.as_ref(), false, None, Some(reply.id), None)
+        .unwrap();
+    assert_eq!(
+        entries[0].tx_slate_state,
+        Some(grin_wallet_libwallet::SlateState::Standard3)
+    );
+    posts.store(0, Ordering::SeqCst);
+    let offer = sender.offer(1_000_000_000).unwrap();
+    let offer_slate = sender
+        .owner
+        .slate_from_slatepack_message(sender.mask.as_ref(), offer, vec![])
+        .unwrap();
+    let reply = foreign.receive_tx(&offer_slate, None, None).unwrap();
+    let packed = receiver
+        .owner
+        .create_slatepack_message(receiver.mask.as_ref(), &reply, None, vec![])
+        .unwrap();
+    let mut intent = sender.load().unwrap();
+    intent.response = Some(packed.clone());
+    intent.stage = super::Phase::Finalizing;
+    sender.save(&intent).unwrap();
+    let (_, mut txs) = sender
+        .owner
+        .retrieve_txs(sender.mask.as_ref(), false, None, Some(reply.id), None)
+        .unwrap();
+    let unfinished = txs.remove(0);
+    let context = {
+        let mut wallet = sender.wallet.lock();
+        wallet
+            .lc_provider()
+            .unwrap()
+            .wallet_inst()
+            .unwrap()
+            .get_private_context(sender.mask.as_ref(), reply.id.as_bytes())
+            .unwrap()
+    };
     sender
         .owner
         .finalize_tx(sender.mask.as_ref(), &reply)
         .unwrap();
+    {
+        let parent = unfinished.parent_key_id.clone();
+        let mut wallet = sender.wallet.lock();
+        let backend = wallet.lc_provider().unwrap().wallet_inst().unwrap();
+        let mut batch = backend.batch(sender.mask.as_ref()).unwrap();
+        batch.save_tx_log_entry(unfinished, &parent).unwrap();
+        batch
+            .save_private_context(reply.id.as_bytes(), &context)
+            .unwrap();
+        batch.commit().unwrap();
+    }
     assert!(sender.cancel().is_err());
     drop(sender);
     let sender = super::Payments::open(&sender_dir, sender_client.clone()).unwrap();
@@ -278,7 +364,60 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
     );
     assert!(!sender.directory.join("intent.json").exists());
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    sender.finalize(&packed, &AtomicBool::new(false)).unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert!(std::fs::read_dir(&sender.directory).unwrap().all(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        !name.ends_with(".posted.json") && !name.ends_with(".cancelled.json")
+    }));
     sender.refresh().unwrap();
+    let signed_bytes = std::fs::read(&first_signed_path).unwrap();
+    std::fs::write(&first_signed_path, b"invalid encoding").unwrap();
+    let before_posts = posts.load(Ordering::SeqCst);
+    let error = sender.rebroadcast().unwrap_err().to_string();
+    assert!(posts.load(Ordering::SeqCst) > before_posts);
+    let ready = sender
+        .status_snapshot([7; 32], "ready", Some(error.clone()))
+        .unwrap();
+    assert_eq!(ready.state, "ready");
+    assert!(ready.balance.is_some());
+    assert_eq!(ready.error, Some(error));
+    std::fs::write(&first_signed_path, signed_bytes).unwrap();
+
+    let (disconnected, receive) = std::sync::mpsc::channel();
+    drop(receive);
+    let relay = std::mem::replace(&mut *sender_client.proxy_tx.lock(), disconnected);
+    let error = sender.rebroadcast().unwrap_err();
+    *sender_client.proxy_tx.lock() = relay;
+    sender.refresh().unwrap();
+    let ready = sender
+        .status_snapshot([7; 32], "ready", Some(error.to_string()))
+        .unwrap();
+    assert!(ready.balance.is_some());
+    assert!(sender
+        .stored_transaction(&reply.id.to_string())
+        .unwrap()
+        .is_some());
+    sender.rebroadcast().unwrap();
+    {
+        let (_, txs) = sender
+            .owner
+            .retrieve_txs(sender.mask.as_ref(), false, None, Some(reply.id), None)
+            .unwrap();
+        assert_eq!(
+            txs[0].tx_slate_state,
+            Some(grin_wallet_libwallet::SlateState::Standard3)
+        );
+        let mut wallet = sender.wallet.lock();
+        assert!(wallet
+            .lc_provider()
+            .unwrap()
+            .wallet_inst()
+            .unwrap()
+            .get_private_context(sender.mask.as_ref(), reply.id.as_bytes())
+            .is_err());
+    }
     let (_, info) = sender
         .owner
         .retrieve_summary_info(sender.mask.as_ref(), false, 1)
@@ -292,23 +431,21 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         "idle"
     );
     sender.refresh().unwrap();
+    sender.rebroadcast().unwrap();
     assert!(posts.load(Ordering::SeqCst) >= 3);
     broadcast.store(true, Ordering::Release);
     sender.refresh().unwrap();
+    sender.rebroadcast().unwrap();
     assert!(!sender.directory.join("intent.json").exists());
     assert_eq!(
         sender.resume(&AtomicBool::new(false)).unwrap()["state"],
         "idle"
     );
     receiver.refresh().unwrap();
-    let received = receiver
-        .status_snapshot(&chain, [7; 32], "ready", None)
-        .unwrap();
-    assert_eq!(received.balance.unwrap().total, 1_000_000_000);
+    let received = receiver.status_snapshot([7; 32], "ready", None).unwrap();
+    assert_eq!(received.balance.unwrap().total, 2_000_000_000);
     sender.refresh().unwrap();
-    let checkpoint = sender
-        .status_snapshot(&chain, [7; 32], "ready", None)
-        .unwrap();
+    let checkpoint = sender.status_snapshot([7; 32], "ready", None).unwrap();
     test_framework::award_block_to_wallet(
         &chain,
         &[],
@@ -316,9 +453,7 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         receiver.mask.as_ref(),
     )
     .unwrap();
-    let unchanged = sender
-        .status_snapshot(&chain, [7; 32], "ready", None)
-        .unwrap();
+    let unchanged = sender.status_snapshot([7; 32], "ready", None).unwrap();
     assert_eq!(unchanged.native_height, checkpoint.native_height);
     assert!(unchanged.native_height < chain.head().unwrap().height);
     {
@@ -438,9 +573,7 @@ fn rebuilding_grin_wallet_database_blocks_allocation_until_the_scan_finishes() {
         .reward(&signer, grin_core::consensus::REWARD)
         .is_err());
     restored.refresh().unwrap();
-    let recovered = restored
-        .status_snapshot(&chain, [7; 32], "ready", None)
-        .unwrap();
+    let recovered = restored.status_snapshot([7; 32], "ready", None).unwrap();
     assert_eq!(
         recovered.balance.unwrap().total,
         grin_core::consensus::REWARD
@@ -454,4 +587,32 @@ fn rebuilding_grin_wallet_database_blocks_allocation_until_the_scan_finishes() {
         .get_unspent(next.output.commitment())
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn wallet_checkpoint_status_does_not_require_native_history() {
+    global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+    let dir = tempfile::tempdir().unwrap();
+    let payments = super::Payments::create(dir.path(), Offline).unwrap();
+    {
+        let mut wallet = payments.wallet.lock();
+        let backend = wallet.lc_provider().unwrap().wallet_inst().unwrap();
+        let mut batch = backend.batch(payments.mask.as_ref()).unwrap();
+        batch
+            .save_last_scanned_block(grin_wallet_libwallet::ScannedBlockInfo {
+                height: 100,
+                hash: "11".repeat(32),
+                start_pmmr_index: 1,
+                last_pmmr_index: 200,
+            })
+            .unwrap();
+        batch.commit().unwrap();
+    }
+    let snapshot = payments
+        .status_snapshot([7; 32], "refreshing", None)
+        .unwrap();
+    assert_eq!(snapshot.native_height, 100);
+    assert_eq!(snapshot.native_head, "11".repeat(32));
+    assert_eq!(snapshot.scanned_pmmr_position, 200);
+    assert!(snapshot.balance.is_none());
 }

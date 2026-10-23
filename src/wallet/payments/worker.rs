@@ -24,7 +24,6 @@ struct Request {
 pub struct PaymentWorker {
     send: mpsc::SyncSender<Request>,
     active: Mutex<()>,
-    cancelling: AtomicBool,
     cancelled: Arc<AtomicBool>,
     snapshot: Arc<RwLock<crate::status::wallet::Snapshot>>,
 }
@@ -41,7 +40,6 @@ impl PaymentWorker {
         let (send, receive) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(RwLock::new(payments.status_snapshot(
-            &chain,
             profile,
             "refreshing",
             None,
@@ -49,7 +47,6 @@ impl PaymentWorker {
         let worker = Arc::new(Self {
             send,
             active: Mutex::new(()),
-            cancelling: AtomicBool::new(false),
             cancelled: cancelled.clone(),
             snapshot: snapshot.clone(),
         });
@@ -72,23 +69,22 @@ impl PaymentWorker {
         if matches!(action, WorkerAction::Cancel) {
             return self.cancel();
         }
-        if self.cancelling.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire) {
             bail!("withdrawal cancellation is in progress");
         }
         let _active = self
             .active
             .try_lock()
             .map_err(|_| anyhow!("withdrawal service is busy"))?;
-        if self.cancelling.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire) {
             bail!("withdrawal cancellation is in progress");
         }
         self.exchange(action)
     }
     fn cancel(&self) -> Result<Value> {
-        if self.cancelling.swap(true, Ordering::AcqRel) {
+        if self.cancelled.swap(true, Ordering::AcqRel) {
             bail!("withdrawal cancellation is already in progress");
         }
-        self.cancelled.store(true, Ordering::Release);
         let result = (|| {
             let _active = self
                 .active
@@ -97,7 +93,6 @@ impl PaymentWorker {
             self.exchange(WorkerAction::Cancel)
         })();
         self.cancelled.store(false, Ordering::Release);
-        self.cancelling.store(false, Ordering::Release);
         result
     }
     fn exchange(&self, action: WorkerAction) -> Result<Value> {
@@ -111,13 +106,11 @@ impl PaymentWorker {
             .map_err(anyhow::Error::msg)
     }
     pub fn snapshot(&self) -> Result<crate::status::wallet::Snapshot> {
-        let mut snapshot = self
+        Ok(self
             .snapshot
             .read()
             .map_err(|_| anyhow!("wallet status poisoned"))?
-            .clone();
-        snapshot.updated_at = chrono::Utc::now().timestamp();
-        Ok(snapshot)
+            .clone())
     }
 }
 fn run(
@@ -135,7 +128,7 @@ fn run(
         *snapshot
             .write()
             .map_err(|_| anyhow!("wallet status poisoned"))? =
-            payments.status_snapshot(&chain, profile, state, error)?;
+            payments.status_snapshot(profile, state, error)?;
         Ok(())
     };
     while !stop.load(Ordering::Acquire) {
@@ -149,8 +142,14 @@ fn run(
             publish("refreshing", None)?;
             match payments.refresh() {
                 Ok(()) if !sync.is_syncing() => {
-                    publish("ready", None)?;
-                    last_head = head;
+                    let error = payments
+                        .rebroadcast()
+                        .err()
+                        .map(|error| format!("transaction rebroadcast: {error}"));
+                    if !sync.is_syncing() {
+                        publish("ready", error)?;
+                        last_head = head;
+                    }
                 }
                 Ok(()) => {}
                 Err(error) => {

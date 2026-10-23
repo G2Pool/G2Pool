@@ -48,16 +48,14 @@ pub struct Reward {
 }
 pub(crate) struct RegistrationPlan {
     pub id: Id,
-    pub record: String,
     pub previous: Option<Vec<u8>>,
     pub bytes: Vec<u8>,
     pub objects: Vec<Object>,
 }
 impl RegistrationPlan {
-    fn existing(record: String, bytes: Vec<u8>) -> Result<Self> {
+    fn existing(bytes: Vec<u8>) -> Result<Self> {
         Ok(Self {
             id: id(&decode::<Registration>(&bytes)?)?,
-            record,
             previous: Some(bytes.clone()),
             bytes,
             objects: Vec::new(),
@@ -193,8 +191,7 @@ impl Signer {
         payments: &payments::Payments<C>,
         transaction_inputs: &[secp::pedersen::Commitment],
     ) -> Result<RegistrationPlan> {
-        let record_name = format!("registration:{}", crate::objects::hex(&self.account));
-        let previous_bytes = store.wallet_record(&record_name)?;
+        let previous_bytes = store.wallet_registration()?;
         let previous = previous_bytes
             .as_deref()
             .map(decode::<Registration>)
@@ -253,7 +250,7 @@ impl Signer {
                 .as_ref()
                 .is_some_and(|registration| registration.fields.birth == view.head);
             if same_head && transaction_inputs.is_empty() {
-                return RegistrationPlan::existing(record_name, previous_bytes.ok_or(Error::View)?);
+                return RegistrationPlan::existing(previous_bytes.ok_or(Error::View)?);
             }
             let mut commitments = Vec::new();
             for row in &inv.rows.0 {
@@ -267,7 +264,7 @@ impl Signer {
                     .iter()
                     .all(|input| !commitments.contains(input))
             {
-                return RegistrationPlan::existing(record_name, previous_bytes.ok_or(Error::View)?);
+                return RegistrationPlan::existing(previous_bytes.ok_or(Error::View)?);
             }
             let presence = view.unspent_many(&view.head, &commitments)?;
             let mut presence = presence.into_iter();
@@ -317,7 +314,6 @@ impl Signer {
         ]);
         Ok(RegistrationPlan {
             id: rid,
-            record: record_name,
             previous: previous_bytes,
             bytes,
             objects,

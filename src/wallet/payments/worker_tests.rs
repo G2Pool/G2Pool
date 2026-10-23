@@ -8,7 +8,6 @@ fn busy_requests_are_rejected_and_cancellation_waits_for_its_own_result() {
     let worker = Arc::new(PaymentWorker {
         send,
         active: Mutex::new(()),
-        cancelling: AtomicBool::new(false),
         cancelled: Arc::new(AtomicBool::new(false)),
         snapshot: Arc::new(RwLock::new(snapshot)),
     });

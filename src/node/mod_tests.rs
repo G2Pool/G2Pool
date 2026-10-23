@@ -294,16 +294,16 @@ fn prepared_template_does_not_publish_after_native_head_changes() {
         .unwrap()
         .run(&wallet, &payments, Transaction::empty())
         .unwrap();
-    assert!(node.store.wallet_registrations().unwrap().is_empty());
+    assert!(node.store.wallet_registration().unwrap().is_none());
     let head = node.chain.head_header().unwrap();
     let block = native_block(&node, &head, 200);
     node.chain
         .process_block(block, grin_chain::Options::MINE)
         .unwrap();
     assert!(matches!(prepared.finish(&mut node), Err(Error::View)));
-    assert!(node.store.wallet_registrations().unwrap().is_empty());
+    assert!(node.store.wallet_registration().unwrap().is_none());
     prepare_template(&mut node, &wallet, &payments, Transaction::empty()).unwrap();
-    assert_eq!(node.store.wallet_registrations().unwrap().len(), 1);
+    assert!(node.store.wallet_registration().unwrap().is_some());
 }
 
 #[test]

@@ -12,7 +12,7 @@ use std::{
 };
 pub const VERSION: u16 = 1;
 pub const SOCKET_FILE: &str = "g2pool.control";
-const MAX_FRAME: usize = 1 << 20;
+const MAX_FRAME: usize = 6 * crate::wallet::payments::MAX_SLATEPACK_BYTES + 1024;
 const MAX_CONNECTIONS: usize = 64;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,12 +112,12 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
             break;
         }
         let newline = buffer.iter().position(|byte| *byte == b'\n');
-        let count = newline.map_or(buffer.len(), |index| index + 1);
+        let count = newline.unwrap_or(buffer.len());
         if line.len().saturating_add(count) > MAX_FRAME {
             return Err(crate::Error::Invalid("control frame"));
         }
         line.extend_from_slice(&buffer[..count]);
-        reader.consume(count);
+        reader.consume(count + usize::from(newline.is_some()));
         if newline.is_some() {
             break;
         }
