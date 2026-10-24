@@ -186,8 +186,9 @@ impl<C: NodeClient + 'static> Payments<C> {
             ) {
                 continue;
             }
+            let id = entry.id;
             if let Err(error) = self.rebroadcast_entry(entry) {
-                first_error.get_or_insert(error);
+                first_error.get_or_insert_with(|| anyhow!("withdrawal {id}: {error}"));
             }
         }
         match first_error {
@@ -644,7 +645,9 @@ impl<C: NodeClient + 'static> Payments<C> {
                 .is_some()
         };
         if !already_on_chain {
-            self.owner.post_tx(self.mask.as_ref(), &slate, false)?;
+            if let Err(error) = self.owner.post_tx(self.mask.as_ref(), &slate, false) {
+                bail!("withdrawal {} is signed and saved for automatic retry; Grin submission failed: {error}", i.id);
+            }
         }
         self.clear_intent()?;
         Ok(())

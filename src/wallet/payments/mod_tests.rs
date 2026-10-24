@@ -300,6 +300,24 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         .join("wallet_data/saved_txs")
         .join(format!("{}.grintx", reply.id));
     std::fs::write(&stored_path, b"interrupted native transaction write").unwrap();
+    let (disconnected, receive) = std::sync::mpsc::channel();
+    drop(receive);
+    let relay = std::mem::replace(&mut *sender_client.proxy_tx.lock(), disconnected);
+    assert!(sender.finalize(&packed, &AtomicBool::new(false)).is_err());
+    assert!(sender.load().unwrap().stage == super::Phase::ReadyToPost);
+    assert!(super::is_signed(
+        &sender
+            .stored_transaction(&reply.id.to_string())
+            .unwrap()
+            .unwrap()
+    ));
+    assert!(sender.cancel().is_err());
+    let error = sender.rebroadcast().unwrap_err().to_string();
+    *sender_client.proxy_tx.lock() = relay;
+    assert!(error.starts_with("withdrawal "));
+    assert!(error.contains("post_tx send"));
+    sender.refresh().unwrap();
+    sender.rebroadcast().unwrap();
     sender.finalize(&packed, &AtomicBool::new(false)).unwrap();
     let first_signed_path = stored_path;
     let (_, entries) = sender
