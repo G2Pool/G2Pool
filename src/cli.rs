@@ -11,6 +11,7 @@ pub(crate) fn command() -> Command {
         .arg(Arg::new("stratum").long("stratum").value_parser(clap::value_parser!(SocketAddr)))
         .arg(Arg::new("pool-listen").long("pool-listen").value_parser(clap::value_parser!(SocketAddr)))
         .arg(Arg::new("grin-listen").long("grin-listen").value_parser(clap::value_parser!(SocketAddr)))
+        .arg(Arg::new("no-tui").long("no-tui").action(clap::ArgAction::SetTrue).help("Run without the terminal interface"))
         .subcommand(Command::new("status").about("Show daemon and wallet status"))
         .subcommand(Command::new("withdraw").about("Withdraw GRIN through Slatepack")
             .long_about("Withdraw GRIN through Slatepack. Copy the offer into your receiving wallet, then paste its reply. Ctrl+C cancels an unsigned offer. Run again to resume an interrupted withdrawal."))
@@ -40,11 +41,12 @@ pub(crate) fn config(matches: &ArgMatches) -> crate::Result<daemon::Config> {
 pub fn run() -> anyhow::Result<()> {
     let matches = command().get_matches();
     if matches.subcommand_name().is_some()
-        && ["stratum", "pool-listen", "grin-listen", "pool"]
+        && (["stratum", "pool-listen", "grin-listen", "pool"]
             .iter()
             .any(|arg| matches.contains_id(arg))
+            || matches.get_flag("no-tui"))
     {
-        anyhow::bail!("pool and listener options apply only when starting the daemon");
+        anyhow::bail!("daemon options apply only when starting the daemon");
     }
     let data = crate::network_data_dir(
         base(&matches),
@@ -63,7 +65,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Some(("withdraw", _)) => println!("{}", wallet::payments::cli::run(&data)?),
-        None => daemon::run(config(&matches)?)?,
+        None => daemon::run(config(&matches)?, !matches.get_flag("no-tui"))?,
         _ => unreachable!(),
     }
     Ok(())

@@ -179,7 +179,9 @@ impl Gate {
     pub(super) fn ban_connection(&self, id: libp2p::swarm::ConnectionId) {
         if let Some(ip) = self.remotes.get(&id) {
             self.bans.ban(*ip, super::bans::DEFAULT_BAN);
-            eprintln!("peer {ip}: malformed RPC data; IP banned for 600 seconds (loopback exempt)");
+            log::warn!(
+                "peer {ip}: malformed RPC data; IP banned for 600 seconds (loopback exempt)"
+            );
         }
     }
     fn duplicate(

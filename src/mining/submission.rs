@@ -229,6 +229,7 @@ impl Solutions {
                     pool_accepted: false,
                 });
             }
+            log::info!("native solution submitted: {}", crate::objects::hex(&id));
             true
         } else {
             false
@@ -259,7 +260,7 @@ impl Solutions {
                 })
             }
             Err(error) if native_accepted => {
-                eprintln!("native solution accepted; pool accounting pending: {error}");
+                log::warn!("native solution accepted; pool accounting pending: {error}");
                 Ok(Submitted {
                     work_id: id,
                     native_accepted,

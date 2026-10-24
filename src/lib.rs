@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod daemon;
+mod tui;
 
 pub mod cli;
 mod codec;

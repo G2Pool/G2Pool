@@ -175,6 +175,7 @@ fn run(
                         .map(|cancelled| serde_json::json!({"state": if cancelled { "cancelled" } else { "no_pending_withdrawal" }})),
                 }
                 };
+                publish("refreshing", None)?;
                 let _ = request
                     .reply
                     .send(result.map_err(|error| error.to_string()));

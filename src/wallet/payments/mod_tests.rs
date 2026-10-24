@@ -231,11 +231,38 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         .owner
         .slate_from_slatepack_message(sender.mask.as_ref(), offer, vec![])
         .unwrap();
-    let mut intent = sender.load().unwrap();
+    let intent_before = std::fs::read(sender.directory.join("intent.json")).unwrap();
+    let wallet_before = sender
+        .owner
+        .retrieve_summary_info(sender.mask.as_ref(), false, 1)
+        .unwrap()
+        .1;
+    for _ in 0..2 {
+        let status = sender.status_snapshot([7; 32], "refreshing", None).unwrap();
+        let pending = status.withdrawal.unwrap();
+        assert_eq!(pending.amount, 1_000_000_000);
+        assert_eq!(pending.fee, offer_slate.fee_fields.fee());
+        assert_eq!(pending.stage, super::Phase::AwaitingResponse);
+        assert_eq!(pending.id, offer_slate.id.to_string());
+        assert_eq!(
+            std::fs::read(sender.directory.join("intent.json")).unwrap(),
+            intent_before
+        );
+    }
+    assert_eq!(
+        sender
+            .owner
+            .retrieve_summary_info(sender.mask.as_ref(), false, 1)
+            .unwrap()
+            .1,
+        wallet_before
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    let mut intent = sender.load().unwrap().0;
     intent.response = Some("\0".repeat(super::MAX_SLATEPACK_BYTES));
     sender.save(&intent).unwrap();
     assert_eq!(
-        sender.load().unwrap().response.unwrap().len(),
+        sender.load().unwrap().0.response.unwrap().len(),
         super::MAX_SLATEPACK_BYTES
     );
     intent.response.as_mut().unwrap().push('\0');
@@ -257,6 +284,11 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
     std::fs::remove_file(&partial_path).unwrap();
     assert!(sender.cancel().unwrap());
     assert!(!sender.directory.join("intent.json").exists());
+    assert!(sender
+        .status_snapshot([7; 32], "refreshing", None)
+        .unwrap()
+        .withdrawal
+        .is_none());
     sender.refresh().unwrap();
     let offer = sender.offer(1_000_000_000).unwrap();
     let offer_slate = sender
@@ -291,7 +323,7 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         .owner
         .create_slatepack_message(receiver.mask.as_ref(), &reply, None, vec![])
         .unwrap();
-    let mut intent = sender.load().unwrap();
+    let mut intent = sender.load().unwrap().0;
     intent.response = Some(packed.clone());
     intent.stage = super::Phase::Finalizing;
     sender.save(&intent).unwrap();
@@ -304,7 +336,7 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
     drop(receive);
     let relay = std::mem::replace(&mut *sender_client.proxy_tx.lock(), disconnected);
     assert!(sender.finalize(&packed, &AtomicBool::new(false)).is_err());
-    assert!(sender.load().unwrap().stage == super::Phase::ReadyToPost);
+    assert!(sender.load().unwrap().0.stage == super::Phase::ReadyToPost);
     assert!(super::is_signed(
         &sender
             .stored_transaction(&reply.id.to_string())
@@ -339,7 +371,7 @@ fn withdrawal_recovers_signing_and_unconfirmed_broadcasts_without_unlocking_inpu
         .owner
         .create_slatepack_message(receiver.mask.as_ref(), &reply, None, vec![])
         .unwrap();
-    let mut intent = sender.load().unwrap();
+    let mut intent = sender.load().unwrap().0;
     intent.response = Some(packed.clone());
     intent.stage = super::Phase::Finalizing;
     sender.save(&intent).unwrap();

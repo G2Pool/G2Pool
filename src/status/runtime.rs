@@ -25,6 +25,7 @@ pub struct Snapshot {
     pub connected_peers: usize,
     pub native_syncing: bool,
     pub pool_recovering: bool,
+    pub pool_tip: Option<String>,
     pub free_disk_bytes: Option<u64>,
     pub database_bytes: u64,
     pub database_limit_bytes: u64,
@@ -63,6 +64,9 @@ pub struct Status {
     database: crate::storage::sharechain::SharechainDb,
 }
 impl Status {
+    pub(crate) fn sync_status(&self) -> grin_chain::SyncStatus {
+        self.sync.status()
+    }
     pub fn new(node: &Node, pool_name: String, path: PathBuf) -> Self {
         Self {
             pool_name,
@@ -107,6 +111,10 @@ impl Status {
             connected_peers: peers,
             native_syncing: syncing,
             pool_recovering: snapshot.recovering,
+            pool_tip: snapshot
+                .revision
+                .and_then(|revision| revision.tip)
+                .map(|tip| crate::objects::hex(&tip)),
             free_disk_bytes: free,
             database_bytes: self
                 .database

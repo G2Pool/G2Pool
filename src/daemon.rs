@@ -18,6 +18,7 @@ use grin_core::{
 use grin_servers::{Server, ServerConfig};
 use std::{
     fs,
+    io::IsTerminal,
     net::{IpAddr, SocketAddr, TcpListener},
     path::PathBuf,
     sync::{atomic::Ordering, Arc, Mutex},
@@ -136,12 +137,47 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
-            eprintln!("runtime shutdown: {error}");
+            log::error!("runtime shutdown: {error}");
         }
     }
 }
 
-pub fn run(config: Config) -> Result<()> {
+pub fn run(config: Config, interactive: bool) -> Result<()> {
+    let interactive =
+        interactive && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let reporting = crate::status::reporting::Reporting::new(interactive)?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::Release))
+        .map_err(|_| Error::Invalid("signal handler"))?;
+    global::set_local_chain_type(config.network);
+    if !interactive {
+        return run_node(&config, &reporting, stop);
+    }
+    struct Shutdown<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Shutdown<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| run_node(&config, &reporting, stop.clone()));
+        let ui = {
+            let _shutdown = Shutdown(&stop);
+            crate::tui::run(&config, &reporting, &stop, || worker.is_finished())
+        };
+        worker
+            .join()
+            .unwrap_or(Err(Error::Invalid("daemon panicked")))
+            .and(ui)
+    })
+}
+
+fn run_node(
+    config: &Config,
+    reporting: &crate::status::reporting::Reporting,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     let mut directories = fs::DirBuilder::new();
     directories.recursive(true);
     #[cfg(unix)]
@@ -200,18 +236,24 @@ pub fn run(config: Config) -> Result<()> {
     global::init_global_accept_fee_base(native.pool_config.accept_fee_base);
     global::init_global_future_time_limit(native.future_time_limit);
     let channel = tokio::sync::mpsc::channel(1);
-    eprintln!("starting embedded Grin node");
+    if stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    reporting.phase("Starting embedded Grin node");
     let grin = Server::start(native, None, None, channel)
         .map_err(|e| Error::NativeUnavailable(format!("native server: {e:?}")))?;
     let chain = grin.chain.clone();
-    let status_chain = chain.clone();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let native_sync = grin.sync_state.clone();
     let payment_client = DirectNodeClient::new(chain.clone(), grin.tx_pool.clone(), stop.clone());
     let mut runtime = Runtime {
         server: Some(grin),
         stop: stop.clone(),
         workers: Vec::new(),
     };
+    if stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    reporting.phase("Opening pool and wallet");
     let genesis = native::hash_bytes(chain.genesis().hash());
     let profile = Profile::new(genesis, config.network, &pool);
     let mut store = Store::open(
@@ -237,19 +279,14 @@ pub fn run(config: Config) -> Result<()> {
     );
     store.bind_wallet(wallet.account())?;
     if !wallet_existed {
-        println!("Created G2Pool wallet.");
+        log::info!("Created G2Pool wallet");
     }
     let mut node = Node::start(
         chain.clone(),
         profile,
         store,
         config.evaluation.clone(),
-        runtime
-            .server
-            .as_ref()
-            .ok_or(Error::Invalid("native server stopped"))?
-            .sync_state
-            .clone(),
+        native_sync.clone(),
     )?;
     node.cancel = stop.clone();
     node.peers = crate::network::peers::Book::open_store(
@@ -259,13 +296,13 @@ pub fn run(config: Config) -> Result<()> {
         &bootstrap_peers,
     )?;
     node.listening_port = config.peer.port();
-    println!(
+    log::info!(
         "pool={} pool-id={} account={}",
         pool.name,
         hex(&node.profile.pool_id),
         hex(&wallet.account())
     );
-    println!(
+    log::info!(
         "network={:?} pool-peer={} stratum={} embedded-grin-p2p={} bootstrap-peers={}",
         config.network,
         config.peer,
@@ -273,9 +310,7 @@ pub fn run(config: Config) -> Result<()> {
         SocketAddr::new(config.grin_host, config.grin_port),
         bootstrap_peers.len()
     );
-    let signal = stop.clone();
-    ctrlc::set_handler(move || signal.store(true, Ordering::Release))
-        .map_err(|_| Error::Invalid("signal handler"))?;
+    let published = node.published.clone();
     let node = Arc::new(Mutex::new(node));
     let (payment_worker, payment_thread) = crate::wallet::payments::PaymentWorker::new(
         payment_service.clone(),
@@ -310,6 +345,11 @@ pub fn run(config: Config) -> Result<()> {
     });
     runtime.workers.push(control_thread);
     let mining = Arc::new(Mining::bounded(node.clone(), wallet, config.jobs.clone())?);
+    *reporting.sources.write() = Some(crate::status::reporting::Sources {
+        node: status,
+        wallet: payment_worker,
+        mining: mining.clone(),
+    });
 
     let miner_listener = TcpListener::bind(config.stratum)?;
     let peer_thread = crate::network::start(
@@ -331,24 +371,24 @@ pub fn run(config: Config) -> Result<()> {
     let outgoing =
         thread::spawn(move || crate::network::outbound::maintain(peer_nodes, peer_signal));
     runtime.workers.push(outgoing);
+    reporting.phase("Running");
     let mut last_gc = Instant::now();
-    let mut last_status = Instant::now() - Duration::from_secs(30);
+    let mut last_peers = Instant::now() - Duration::from_secs(30);
     let mut recovery_retry = Instant::now();
     let mut solution_retry = Instant::now();
-    let mut solution_error = None;
-    let mut mining_error = None;
-    let mut recovery_error = None;
     let mut service_failed = false;
     while !stop.load(Ordering::Acquire) {
         if runtime.workers.iter().any(|worker| worker.is_finished()) {
             service_failed = true;
             stop.store(true, Ordering::Release);
-            eprintln!("a runtime service stopped unexpectedly; shutting down");
+            log::error!("a runtime service stopped unexpectedly; shutting down");
             break;
         }
         if Instant::now() >= solution_retry {
             match mining.solutions.replay(&node) {
-                Ok(()) => solution_error = None,
+                Ok(()) => {
+                    reporting.condition("Solution recovery", None);
+                }
                 Err(
                     error @ (Error::Capacity(_)
                     | Error::EvaluationTime
@@ -358,10 +398,9 @@ pub fn run(config: Config) -> Result<()> {
                     | Error::Future),
                 ) => {
                     let message = error.to_string();
-                    if solution_error.as_ref() != Some(&message) {
-                        eprintln!("solution recovery pending: {message}");
+                    if reporting.condition("Solution recovery", Some(message.clone())) {
+                        log::warn!("solution recovery pending: {message}");
                     }
-                    solution_error = Some(message);
                 }
                 Err(Error::Cancelled) if stop.load(Ordering::Acquire) => break,
                 Err(error) => return Err(error),
@@ -383,8 +422,16 @@ pub fn run(config: Config) -> Result<()> {
                 Ok(())
             })();
             match result {
-                Ok(()) => recovery_error = None,
-                Err(Error::View) => {}
+                Ok(()) => {
+                    reporting.condition("Pool recovery", None);
+                }
+                Err(Error::View) => {
+                    reporting.condition("Pool recovery", None);
+                }
+                Err(Error::NativeUnavailable(_)) if native_sync.is_syncing() => {
+                    reporting.condition("Pool recovery", None);
+                    recovery_retry = Instant::now() + Duration::from_secs(1);
+                }
                 Err(
                     error @ (Error::Capacity(_)
                     | Error::EvaluationTime
@@ -392,50 +439,16 @@ pub fn run(config: Config) -> Result<()> {
                     | Error::NativeUnavailable(_)),
                 ) => {
                     let message = error.to_string();
-                    if recovery_error.as_ref() != Some(&message) {
-                        eprintln!("pool recovery retryable: {error}");
+                    if reporting.condition("Pool recovery", Some(message)) {
+                        log::info!("pool recovery retryable: {error}");
                     }
-                    recovery_error = Some(message);
                     recovery_retry = Instant::now() + Duration::from_secs(1);
                 }
                 Err(Error::Cancelled) if stop.load(Ordering::Acquire) => break,
                 Err(error) => return Err(error),
             }
         }
-        if last_status.elapsed() >= Duration::from_secs(30) {
-            let sync = if runtime
-                .server
-                .as_ref()
-                .is_some_and(|native| native.sync_state.is_syncing())
-            {
-                "syncing"
-            } else {
-                "ready"
-            };
-            let overlay = status
-                .snapshot()
-                .map(|s| format!("pool {}; {} peers", s.state, s.connected_peers))
-                .unwrap_or_else(|_| "pool status pending".into());
-            println!("{overlay}");
-            match payment_worker.snapshot() {
-                Ok(snapshot) => println!(
-                    "Grin {sync}; height {}; wallet {}{}",
-                    status_chain
-                        .head_header()
-                        .map(|header| header.height)
-                        .unwrap_or(snapshot.native_height),
-                    snapshot.state,
-                    snapshot
-                        .balance
-                        .map(|balance| format!(
-                            "; balance {}.{:09} GRIN",
-                            balance.total / 1_000_000_000,
-                            balance.total % 1_000_000_000
-                        ))
-                        .unwrap_or_default()
-                ),
-                Err(_) => println!("Grin {sync}; wallet balance scan pending"),
-            }
+        if last_peers.elapsed() >= Duration::from_secs(30) {
             let routing = {
                 node.lock()
                     .map_err(|_| Error::Invalid("node poisoned"))?
@@ -444,15 +457,21 @@ pub fn run(config: Config) -> Result<()> {
             };
             if let Some(routing) = routing {
                 match routing.write() {
-                    Ok(generation) => node
-                        .lock()
-                        .map_err(|_| Error::Invalid("node poisoned"))?
-                        .peers
-                        .persisted(generation),
-                    Err(error) => eprintln!("peer persistence retryable: {error}"),
+                    Ok(generation) => {
+                        node.lock()
+                            .map_err(|_| Error::Invalid("node poisoned"))?
+                            .peers
+                            .persisted(generation);
+                        reporting.condition("Address book", None);
+                    }
+                    Err(error) => {
+                        if reporting.condition("Address book", Some(error.to_string())) {
+                            log::warn!("peer persistence retryable: {error}");
+                        }
+                    }
                 }
             }
-            last_status = Instant::now();
+            last_peers = Instant::now();
         }
         if last_gc.elapsed() > Duration::from_secs(60) {
             let prepared = node
@@ -471,21 +490,19 @@ pub fn run(config: Config) -> Result<()> {
                     &pins,
                 );
             match result {
-                Ok(_) | Err(Error::View) => {}
-                Err(Error::NativeUnavailable(_))
-                    if runtime
-                        .server
-                        .as_ref()
-                        .is_some_and(|native| native.sync_state.is_syncing()) => {}
-                Err(error) => eprintln!("storage maintenance retryable: {error}"),
+                Ok(_) | Err(Error::View) => {
+                    reporting.condition("Storage maintenance", None);
+                }
+                Err(Error::NativeUnavailable(_)) if native_sync.is_syncing() => {}
+                Err(error) => {
+                    if reporting.condition("Storage maintenance", Some(error.to_string())) {
+                        log::warn!("storage maintenance retryable: {error}");
+                    }
+                }
             }
             last_gc = Instant::now();
         }
-        if runtime
-            .server
-            .as_ref()
-            .is_some_and(|native| native.sync_state.is_syncing())
-        {
+        if native_sync.is_syncing() {
             thread::sleep(Duration::from_millis(500));
             continue;
         }
@@ -511,27 +528,36 @@ pub fn run(config: Config) -> Result<()> {
                 Ok(template) => match mining.publish(template) {
                     Ok(_) => {
                         last = Instant::now();
-                        mining_error = None;
+                        reporting.condition("Mining", None);
+                        reporting.condition("Job publication", None);
                     }
                     Err(Error::Capacity(reason)) => {
-                        eprintln!("job publication retryable: {reason}");
+                        if reporting.condition("Job publication", Some(reason.into())) {
+                            log::warn!("job publication retryable: {reason}");
+                        }
                         thread::sleep(Duration::from_secs(1));
                     }
                     Err(error) => return Err(error),
                 },
                 Err(e) => {
-                    let message = e.to_string();
-                    if mining_error.as_ref() != Some(&message) {
-                        eprintln!("mining retryable: {message}");
+                    let expected = matches!(e, Error::View)
+                        || native_sync.is_syncing()
+                        || published
+                            .read()
+                            .map_err(|_| Error::Invalid("publication snapshot poisoned"))?
+                            .recovering;
+                    if expected {
+                        reporting.condition("Mining", None);
+                    } else if reporting.condition("Mining", Some(e.to_string())) {
+                        log::warn!("mining waiting: {e}");
                     }
-                    mining_error = Some(message);
                     thread::sleep(Duration::from_secs(1));
                 }
             }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("shutdown requested; stopping runtime services");
+    reporting.phase("Stopping runtime services");
     let routing = node
         .lock()
         .map_err(|_| Error::Invalid("node poisoned"))?

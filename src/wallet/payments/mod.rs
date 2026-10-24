@@ -34,13 +34,21 @@ pub struct Payments<C: NodeClient + 'static> {
     directory: PathBuf,
     account: [u8; 33],
 }
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum Phase {
+pub(crate) enum Phase {
     Locking,
     AwaitingResponse,
     Finalizing,
     ReadyToPost,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Withdrawal {
+    pub id: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub stage: Phase,
+    pub outgoing: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Intent {
@@ -251,33 +259,28 @@ impl<C: NodeClient + 'static> Payments<C> {
             let hash = grin_core::core::hash::Hash::from_hex(&scanned.hash)?;
             Some((scanned.height, crate::native::hash_bytes(hash)))
         };
-        if state != "ready" {
-            return Ok(crate::status::wallet::snapshot(
-                &self.account,
-                &profile,
-                head,
-                scanned.last_pmmr_index,
-                state,
-                None,
-                error,
-            ));
-        }
-        let (_, info) = self
-            .owner
-            .retrieve_summary_info(self.mask.as_ref(), false, 1)?;
-        let (_, outputs) = self
-            .owner
-            .retrieve_outputs(self.mask.as_ref(), false, false, None)?;
-        let output_count = outputs.len();
-        Ok(crate::status::wallet::snapshot(
+        let balance = if state == "ready" {
+            let (_, info) = self
+                .owner
+                .retrieve_summary_info(self.mask.as_ref(), false, 1)?;
+            let (_, outputs) =
+                self.owner
+                    .retrieve_outputs(self.mask.as_ref(), false, false, None)?;
+            Some((info, outputs.len()))
+        } else {
+            None
+        };
+        let mut snapshot = crate::status::wallet::snapshot(
             &self.account,
             &profile,
             head,
             scanned.last_pmmr_index,
             state,
-            Some((info, output_count)),
+            balance,
             error,
-        ))
+        );
+        snapshot.withdrawal = self.withdrawal()?;
+        Ok(snapshot)
     }
     fn stored_transaction(&self, id: &str) -> Result<Option<grin_wallet_libwallet::Slate>> {
         let id = id.parse()?;
@@ -324,7 +327,7 @@ impl<C: NodeClient + 'static> Payments<C> {
             true,
         )
     }
-    fn load(&self) -> Result<Intent> {
+    fn load(&self) -> Result<(Intent, grin_wallet_libwallet::Slate)> {
         let i: Intent = serde_json::from_slice(&private_read(
             &self.directory.join("intent.json"),
             MAX_INTENT_BYTES,
@@ -341,7 +344,20 @@ impl<C: NodeClient + 'static> Payments<C> {
         {
             bail!("invalid payment intent");
         }
-        Ok(i)
+        Ok((i, original))
+    }
+    fn withdrawal(&self) -> Result<Option<Withdrawal>> {
+        if !self.directory.join("intent.json").exists() {
+            return Ok(None);
+        }
+        let (intent, original) = self.load()?;
+        Ok(Some(Withdrawal {
+            id: intent.id,
+            amount: intent.amount,
+            fee: original.fee_fields.fee(),
+            stage: intent.stage,
+            outgoing: intent.outgoing,
+        }))
     }
     pub(super) fn resume(
         &self,
@@ -350,7 +366,7 @@ impl<C: NodeClient + 'static> Payments<C> {
         if !self.directory.join("intent.json").exists() {
             return Ok(serde_json::json!({"state": "idle"}));
         }
-        let intent = self.load()?;
+        let (intent, _) = self.load()?;
         if matches!(intent.stage, Phase::Locking | Phase::AwaitingResponse) {
             let slatepack = self.offer(intent.amount)?;
             return Ok(
@@ -366,16 +382,11 @@ impl<C: NodeClient + 'static> Payments<C> {
     pub(super) fn offer(&self, amount: u64) -> Result<String> {
         check_amount(amount)?;
         if self.directory.join("intent.json").exists() {
-            let mut previous = self.load()?;
+            let (mut previous, original) = self.load()?;
             if previous.amount == amount
                 && matches!(previous.stage, Phase::Locking | Phase::AwaitingResponse)
             {
                 if previous.stage == Phase::Locking {
-                    let original = self.owner.slate_from_slatepack_message(
-                        self.mask.as_ref(),
-                        previous.outgoing.clone(),
-                        vec![],
-                    )?;
                     let (_, txs) = self.owner.retrieve_txs(
                         self.mask.as_ref(),
                         false,
@@ -522,7 +533,7 @@ impl<C: NodeClient + 'static> Payments<C> {
             }
             bail!("response does not match a completed payment");
         }
-        let mut i = self.load()?;
+        let (mut i, original) = self.load()?;
         if let Some(saved) = i.response.as_ref() {
             if response != saved {
                 bail!("supplied response differs from the saved payment response");
@@ -548,11 +559,6 @@ impl<C: NodeClient + 'static> Payments<C> {
             let slate = self.owner.slate_from_slatepack_message(
                 self.mask.as_ref(),
                 packed.clone(),
-                vec![],
-            )?;
-            let original = self.owner.slate_from_slatepack_message(
-                self.mask.as_ref(),
-                i.outgoing.clone(),
                 vec![],
             )?;
             if slate.id.to_string() != i.id
@@ -656,15 +662,10 @@ impl<C: NodeClient + 'static> Payments<C> {
         if !self.directory.join("intent.json").exists() {
             return Ok(false);
         }
-        let i = self.load()?;
+        let (i, original) = self.load()?;
         if i.stage == Phase::ReadyToPost || i.finalized.is_some() {
             bail!("cannot cancel a payment after finalization began");
         }
-        let original = self.owner.slate_from_slatepack_message(
-            self.mask.as_ref(),
-            i.outgoing.clone(),
-            vec![],
-        )?;
         let (_, txs) =
             self.owner
                 .retrieve_txs(self.mask.as_ref(), false, None, Some(original.id), None)?;

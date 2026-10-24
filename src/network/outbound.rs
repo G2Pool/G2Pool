@@ -27,7 +27,7 @@ impl Drop for Connection {
             .take()
             .is_some_and(|worker| worker.join().is_err())
         {
-            eprintln!("outbound peer worker panicked");
+            log::error!("outbound peer worker panicked");
         }
     }
 }
@@ -200,7 +200,7 @@ impl Connections {
                 if let Err(error) = result {
                     if !retryable(&error) {
                         if !matches!(error, Error::Cancelled) {
-                            eprintln!("peer {address}: {error}");
+                            log::info!("peer {address}: {error}");
                         }
                         break;
                     }

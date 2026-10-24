@@ -14,6 +14,7 @@ pub struct Snapshot {
     pub balance: Option<grin_wallet_libwallet::WalletInfo>,
     pub output_count: usize,
     pub error: Option<String>,
+    pub withdrawal: Option<crate::wallet::payments::Withdrawal>,
 }
 
 pub fn snapshot(
@@ -41,5 +42,6 @@ pub fn snapshot(
         balance,
         output_count,
         error,
+        withdrawal: None,
     }
 }
