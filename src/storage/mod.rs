@@ -155,11 +155,11 @@ impl Store {
         let map_bytes = usize::try_from(
             limits
                 .bytes
-                .checked_add(2 * sharechain::WRITE_RESERVE)
+                .checked_add(2 * sharechain::SOLUTION_RESERVE_BYTES)
                 .ok_or(Error::Capacity("storage map size"))?,
         )
         .map_err(|_| Error::Capacity("storage map size"))?
-        .max(sharechain::MAP_BYTES);
+        .max(sharechain::MIN_MAP_BYTES);
         let mut index = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
             map_bytes,
@@ -170,7 +170,6 @@ impl Store {
         let runtime = index
             .runtime_store(RuntimeLimits {
                 max_objects: limits.objects,
-                max_bytes: limits.bytes,
                 max_object_bytes: 8 * 1024 * 1024,
                 max_lease_keys: limits.objects.min(MAX_RUNTIME_LEASE_KEYS),
                 max_head_keys: limits.objects.min(MAX_RUNTIME_HEAD_KEYS),

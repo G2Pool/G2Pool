@@ -3,7 +3,7 @@ use heed::{types::Bytes, Database, Env, RoTxn, WithoutTls};
 
 pub(crate) const SOLUTION_RECORDS: usize = 1024;
 pub(crate) const SOLUTION_OBJECTS: u64 = (SOLUTION_RECORDS * 6) as u64;
-pub(crate) const WRITE_RESERVE: u64 = 512 * 1024 * 1024;
+pub(crate) const SOLUTION_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct DatabaseBudget {

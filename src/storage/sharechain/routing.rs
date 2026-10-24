@@ -151,7 +151,7 @@ impl SharechainDb {
     where
         E: From<heed::Error> + From<Error>,
     {
-        self.transaction(super::WRITE_RESERVE, operation)
+        self.transaction(super::SOLUTION_RESERVE_BYTES, operation)
     }
     pub(crate) fn auxiliary_transaction<T, E>(
         &self,

@@ -7,7 +7,6 @@ fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space()
     let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, [7; 32]).unwrap();
     let limits = RuntimeLimits {
         max_objects: 100,
-        max_bytes: 1024 * 1024,
         max_object_bytes: 1024 * 1024,
         max_lease_keys: 100,
         max_head_keys: 100,
@@ -43,7 +42,7 @@ fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space()
     let bytes = vec![1; 128 * 1024];
     assert!(matches!(
         db.auxiliary_write(b"test", &bytes),
-        Err(Error::Quota(_))
+        Err(Error::Quota("pool database bytes"))
     ));
     assert!(db.auxiliary_read(b"test").unwrap().is_none());
     assert!(matches!(
@@ -83,9 +82,9 @@ fn one_budget_bounds_runtime_and_auxiliary_writes_but_preserves_solution_space()
                 ..Default::default()
             }
         ),
-        Err(Error::Quota(_))
+        Err(Error::Quota("pool database bytes"))
     ));
-    assert_eq!(runtime.snapshot().unwrap().usage().unwrap(), (0, 0));
+    assert_eq!(runtime.snapshot().unwrap().object_count().unwrap(), 0);
     assert_eq!(runtime.snapshot().unwrap().revision().unwrap(), selected);
     assert_eq!(
         runtime.snapshot().unwrap().heads(2).unwrap(),
@@ -160,10 +159,9 @@ fn bounded_cleanup_can_run_at_the_live_budget_with_an_old_reader() {
 #[test]
 fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = SharechainDb::open(dir.path(), 8 * 1024 * 1024, [7; 32]).unwrap();
+    let mut db = SharechainDb::open(dir.path(), 16 * 1024 * 1024, [7; 32]).unwrap();
     let limits = RuntimeLimits {
         max_objects: 10,
-        max_bytes: 8 * 1024 * 1024,
         max_object_bytes: 4 * 1024 * 1024,
         max_lease_keys: 10,
         max_head_keys: 10,
@@ -245,6 +243,49 @@ fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
         Err(Error::Quota(_))
     ));
     assert!(db.auxiliary_read(b"overflow").unwrap().is_none());
+    let expanded = vec![2; 4 * 1024 * 1024];
+    let mut replacement = RuntimeReplacement {
+        key: keys[1],
+        logical_digest: digest,
+        expected_digest: digest,
+        expected_representation: Representation::Canonical,
+        representation: Representation::Compact,
+        bytes: &expanded,
+    };
+    assert!(matches!(
+        runtime.apply(
+            2,
+            RuntimeBatch {
+                replacements: std::slice::from_ref(&replacement),
+                ..Default::default()
+            }
+        ),
+        Err(Error::Quota("pool database bytes"))
+    ));
+    assert_eq!(
+        runtime
+            .snapshot()
+            .unwrap()
+            .object(keys[1], None)
+            .unwrap()
+            .unwrap()
+            .digest,
+        digest
+    );
+    let compact = &payload[..payload.len() - 64 * 1024];
+    replacement.bytes = compact;
+    let before_compaction = db.used_bytes().unwrap();
+    runtime
+        .apply(
+            2,
+            RuntimeBatch {
+                replacements: &[replacement],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(db.used_bytes().unwrap() < before_compaction);
+    assert!(db.used_bytes().unwrap() > db.byte_limit());
     assert_eq!(
         runtime.collect_keep(1000, 900, 256, &[]).unwrap().removed,
         1
@@ -263,7 +304,7 @@ fn retirement_and_collection_progress_at_quota_without_copying_large_bodies() {
             .unwrap()
             .unwrap()
             .bytes,
-        payload
+        compact
     );
     assert_eq!(old.object(keys[0], None).unwrap().unwrap().bytes, payload);
     assert!(db.used_bytes().unwrap() < db.byte_limit());

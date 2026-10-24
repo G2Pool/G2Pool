@@ -3,7 +3,6 @@ use crate::storage::sharechain::SharechainDb;
 fn limits() -> RuntimeLimits {
     RuntimeLimits {
         max_objects: 10,
-        max_bytes: 10000,
         max_object_bytes: 1000,
         max_lease_keys: 10,
         max_head_keys: 10,
@@ -40,7 +39,6 @@ fn runtime_limits_are_startup_policy_and_smaller_limits_preserve_retained_data()
     drop(runtime);
     let smaller = RuntimeLimits {
         max_objects: 1,
-        max_bytes: 1000,
         max_heads: 1,
         max_head_keys: 1,
         max_lease_keys: 1,
@@ -151,7 +149,7 @@ fn quota_failure_rolls_back_every_namespace() {
         )
         .is_err());
     let snap = s.snapshot().unwrap();
-    assert_eq!(snap.usage().unwrap(), (0, 0));
+    assert_eq!(snap.object_count().unwrap(), 0);
     assert!(snap.lease([1; 32]).unwrap().is_none());
     assert!(snap.lease([2; 32]).unwrap().is_some());
     assert!(snap.object(rk(1), None).unwrap().is_none());
@@ -859,7 +857,7 @@ fn incremental_lease_union_preserves_deadline_and_atomic_quota() {
         Some((900, vec![rk(1), rk(2)]))
     );
     assert_eq!(snap.lease([2; 32]).unwrap(), Some((1100, vec![rk(1)])));
-    assert_eq!(snap.usage().unwrap(), (0, 0));
+    assert_eq!(snap.object_count().unwrap(), 0);
 }
 #[test]
 fn persistent_head_delta_has_bounded_path_copy() {
@@ -867,7 +865,6 @@ fn persistent_head_delta_has_bounded_path_copy() {
     let db = open(dir.path());
     let mut l = limits();
     l.max_objects = 1100;
-    l.max_bytes = 1000000;
     l.max_head_keys = 1100;
     let s = db.runtime_store(l).unwrap();
     let keys: Vec<_> = (0u64..1000)
@@ -1035,7 +1032,7 @@ fn collecting_immutable_objects_also_reclaims_their_metadata() {
             .unwrap();
         assert_eq!(store.collect(1000, 0, 10).unwrap().removed, 1);
     }
-    assert_eq!(store.snapshot().unwrap().usage().unwrap(), (0, 0));
+    assert_eq!(store.snapshot().unwrap().object_count().unwrap(), 0);
     let tx = store.env.read_txn().unwrap();
     for prefix in [b"i", b"m", b"p", b"s", b"o"] {
         assert_eq!(store.db.prefix_iter(&tx, prefix).unwrap().count(), 0);
@@ -1122,7 +1119,7 @@ fn durable_retention_shares_head_dependencies_and_releases_atomically() {
     for _ in 0..20 {
         store.collect(7200, 0, 10).unwrap();
     }
-    assert_eq!(store.snapshot().unwrap().usage().unwrap(), (0, 0));
+    assert_eq!(store.snapshot().unwrap().object_count().unwrap(), 0);
 }
 
 #[test]
@@ -1166,7 +1163,7 @@ fn winning_solution_objects_use_reserved_capacity_without_admitting_peer_growth(
         Ok(())
     })
     .unwrap();
-    assert_eq!(store.snapshot().unwrap().usage().unwrap().0, 2);
+    assert_eq!(store.snapshot().unwrap().object_count().unwrap(), 2);
     assert!(matches!(
         store.apply(
             0,
@@ -1185,7 +1182,6 @@ fn collection_keeps_up_with_sustained_head_updates() {
     let db = open(dir.path());
     let mut bounds = limits();
     bounds.max_objects = 10000;
-    bounds.max_bytes = 4 * 1024 * 1024;
     bounds.max_head_keys = 10000;
     let store = db.runtime_store(bounds).unwrap();
     let route = |n: u64| RoutingKey {

@@ -2,7 +2,7 @@
 
 use heed::{types::Bytes, Database, Env, EnvOpenOptions, WithoutTls};
 mod budget;
-pub(crate) use budget::{SOLUTION_RECORDS, WRITE_RESERVE};
+pub(crate) use budget::{SOLUTION_RECORDS, SOLUTION_RESERVE_BYTES};
 mod dependencies;
 mod routing;
 mod runtime_store;
@@ -16,7 +16,7 @@ use std::path::Path;
 
 pub(crate) const ACQUISITION_LIFETIME: u64 = 900;
 pub(crate) const STORAGE_FORMAT: u32 = 1;
-pub const MAP_BYTES: usize = 1 << 30;
+pub const MIN_MAP_BYTES: usize = 1 << 30;
 pub type Id = [u8; 32];
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -64,7 +64,6 @@ pub struct RuntimeVariant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeLimits {
     pub max_objects: u64,
-    pub max_bytes: u64,
     pub max_object_bytes: u64,
     pub max_lease_keys: u64,
     pub max_head_keys: u64,
@@ -184,7 +183,6 @@ impl RuntimeStore {
     ) -> Result<Self> {
         if [
             limits.max_objects,
-            limits.max_bytes,
             limits.max_object_bytes,
             limits.max_lease_keys,
             limits.max_head_keys,
@@ -201,7 +199,6 @@ impl RuntimeStore {
             > limits
                 .max_objects
                 .saturating_add(super::budget::SOLUTION_OBJECTS)
-            || num(db.get(&tx, b"BYTES")?)? > limits.max_bytes.saturating_add(super::WRITE_RESERVE)
         {
             return Err(Error::Quota(
                 "configured runtime limits below existing usage",
@@ -347,10 +344,6 @@ impl RuntimeStore {
         } else {
             0
         });
-        let max_bytes =
-            self.limits
-                .max_bytes
-                .saturating_add(if solution { super::WRITE_RESERVE } else { 0 });
         if batch.objects.len() as u64 > max_objects
             || batch.replacements.len() as u64 > self.limits.max_objects
             || batch.seals.len() as u64 > max_objects
@@ -395,8 +388,6 @@ impl RuntimeStore {
         }
         self.expire(tx, now)?;
         let mut count = num(self.db.get(tx, b"COUNT")?)?;
-        let mut bytes = num(self.db.get(tx, b"BYTES")?)?;
-        let previous_object_bytes = bytes;
         for object in batch.objects {
             if object.bytes.len() as u64 > self.limits.max_object_bytes {
                 return Err(Error::Quota("runtime object quota"));
@@ -455,10 +446,7 @@ impl RuntimeStore {
             count = count
                 .checked_add(1)
                 .ok_or(Error::Invalid("runtime count overflow"))?;
-            bytes = bytes
-                .checked_add(value.len() as u64)
-                .ok_or(Error::Invalid("runtime bytes overflow"))?;
-            if count > max_objects || bytes > max_bytes {
+            if count > max_objects {
                 return Err(Error::Quota("runtime object quota"));
             }
             self.db.put(tx, &mk, &[mode])?;
@@ -493,7 +481,6 @@ impl RuntimeStore {
                 return Err(Error::Quota("runtime object quota"));
             }
             let seen = self.seen(tx, &old_key[1..])?;
-            let old_len = old.len() as u64;
             let physical = digest(replacement.bytes);
             let mut value = replacement.representation.bytes().to_vec();
             value.extend(physical);
@@ -502,13 +489,6 @@ impl RuntimeStore {
             new_key.extend(physical);
             if new_key != old_key && self.db.get(tx, &new_key)?.is_some() {
                 return Err(Error::Invalid("runtime replacement already staged"));
-            }
-            bytes = bytes
-                .checked_sub(old_len)
-                .and_then(|b| b.checked_add(value.len() as u64))
-                .ok_or(Error::Invalid("runtime replacement bytes overflow"))?;
-            if bytes > max_bytes && bytes > previous_object_bytes {
-                return Err(Error::Quota("runtime object quota"));
             }
             self.db.delete(tx, &old_key)?;
             self.db.delete(tx, &key(b't', &old_key[1..]))?;
@@ -698,7 +678,6 @@ impl RuntimeStore {
             }
         }
         self.db.put(tx, b"COUNT", &count.to_be_bytes())?;
-        self.db.put(tx, b"BYTES", &bytes.to_be_bytes())?;
         self.db.put(tx, b"REVISION", &next.encode())?;
         Ok(next)
     }
@@ -780,20 +759,11 @@ impl RuntimeStore {
             .db
             .range(&tx, &(start, Bound::Excluded(b"p".as_slice())))?
             .take(limit)
-            .map(|r| {
-                r.map(|(k, v)| {
-                    (
-                        k.to_vec(),
-                        v.len(),
-                        v[..v.len().min(OBJECT_HEADER_BYTES)].to_vec(),
-                    )
-                })
-            })
+            .map(|r| r.map(|(k, v)| (k.to_vec(), v[..v.len().min(OBJECT_HEADER_BYTES)].to_vec())))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut stats = RuntimeGc::default();
         let mut count = num(self.db.get(&tx, b"COUNT")?)?;
-        let mut bytes = num(self.db.get(&tx, b"BYTES")?)?;
-        for (k, physical_len, v) in &rows {
+        for (k, v) in &rows {
             stats.examined += 1;
             if k.len() != 66
                 || v.len() < OBJECT_HEADER_BYTES
@@ -812,9 +782,6 @@ impl RuntimeStore {
                 count = count
                     .checked_sub(1)
                     .ok_or(Error::Invalid("runtime count underflow"))?;
-                bytes = bytes
-                    .checked_sub(*physical_len as u64)
-                    .ok_or(Error::Invalid("runtime bytes underflow"))?;
                 stats.removed += 1;
                 let preferred = key(b'p', &routing.bytes());
                 if self.db.get(&tx, &preferred)?.is_some_and(|d| d == &k[34..]) {
@@ -844,7 +811,6 @@ impl RuntimeStore {
                 .put(&mut tx, b"GC-CURSOR", &rows.last().unwrap().0)?;
         }
         self.db.put(&mut tx, b"COUNT", &count.to_be_bytes())?;
-        self.db.put(&mut tx, b"BYTES", &bytes.to_be_bytes())?;
         tx.commit()?;
         Ok(stats)
     }
@@ -864,8 +830,8 @@ impl RuntimeSnapshot {
         self.read(|reader| reader.revision())
     }
     #[cfg(test)]
-    pub fn usage(&self) -> Result<(u64, u64)> {
-        self.read(|reader| reader.usage())
+    pub fn object_count(&self) -> Result<u64> {
+        self.read(|reader| num(reader.store.db.get(reader.txn, b"COUNT")?))
     }
     pub fn heads(&self, limit: usize) -> Result<Vec<(Id, Vec<u8>)>> {
         self.read(|reader| reader.heads(limit))
@@ -918,13 +884,6 @@ struct RuntimeReader<'a> {
 impl RuntimeReader<'_> {
     pub fn revision(&self) -> Result<RuntimeRevision> {
         self.store.revision(self.txn)
-    }
-    #[cfg(test)]
-    pub fn usage(&self) -> Result<(u64, u64)> {
-        Ok((
-            num(self.store.db.get(self.txn, b"COUNT")?)?,
-            num(self.store.db.get(self.txn, b"BYTES")?)?,
-        ))
     }
     pub fn heads(&self, limit: usize) -> Result<Vec<(Id, Vec<u8>)>> {
         self.store

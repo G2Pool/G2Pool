@@ -18,7 +18,7 @@ use grin_core::{core::Block, pow::Proof};
 use std::sync::{Arc, Mutex};
 const PREFIX: &[u8] = b"aux/native/submission/";
 const MAX_RECORD: usize = 64 * 1024 * 1024;
-const MAX_BYTES: u64 = crate::storage::sharechain::WRITE_RESERVE;
+const MAX_BYTES: u64 = crate::storage::sharechain::SOLUTION_RESERVE_BYTES;
 const MAX_RECORDS: usize = crate::storage::sharechain::SOLUTION_RECORDS;
 #[derive(Clone)]
 pub struct Solutions {

@@ -145,7 +145,7 @@ fn malformed_routing_rows_do_not_recreate_wallet_state() {
     drop(store);
     let sharechain = crate::storage::sharechain::SharechainDb::open(
         &path.with_extension("sharechain"),
-        crate::storage::sharechain::MAP_BYTES,
+        crate::storage::sharechain::MIN_MAP_BYTES,
         [1; 32],
     )
     .unwrap();
@@ -186,7 +186,7 @@ impl Book {
     ) -> Result<Self> {
         let sharechain = crate::storage::sharechain::SharechainDb::open(
             &path.with_extension("sharechain"),
-            crate::storage::sharechain::MAP_BYTES,
+            crate::storage::sharechain::MIN_MAP_BYTES,
             pool_id,
         )
         .map_err(crate::storage::runtime_error)?;
