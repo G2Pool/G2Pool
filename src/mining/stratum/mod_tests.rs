@@ -1,4 +1,5 @@
 use super::*;
+use std::thread;
 #[test]
 fn unscaled_miner_target_cannot_hide_a_scaled_eligible_proof() {
     let base = 1u128 << 64;
@@ -36,31 +37,150 @@ fn unscaled_miner_target_cannot_hide_a_scaled_eligible_proof() {
     assert!(16384 * base / hash >= 16385);
     assert_eq!(base / hash, 1);
 }
-#[test]
-fn slow_partial_request_cannot_extend_its_deadline() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let sender = thread::spawn(move || {
-        let mut stream = TcpStream::connect(address).unwrap();
+#[tokio::test]
+async fn slow_partial_request_cannot_extend_its_deadline() {
+    let (reader, mut writer) = tokio::io::duplex(LINE);
+    let sender = tokio::spawn(async move {
         for byte in b"{}\n" {
-            if stream.write_all(&[*byte]).is_err() {
+            if writer.write_all(&[*byte]).await.is_err() {
                 break;
             }
-            thread::sleep(Duration::from_millis(70));
+            tokio::time::sleep(Duration::from_millis(70)).await;
         }
     });
-    let (stream, _) = listener.accept().unwrap();
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(reader);
     assert!(matches!(
         read_line(
             &mut reader,
-            &AtomicBool::new(false),
-            Instant::now() + Duration::from_millis(100)
-        ),
+            tokio::time::Instant::now() + Duration::from_millis(100)
+        )
+        .await,
         Err(Error::Capacity("partial Stratum line"))
     ));
     drop(reader);
-    sender.join().unwrap();
+    sender.await.unwrap();
+}
+
+#[tokio::test]
+async fn publications_reach_miners_during_idle_reads_partial_requests_and_submissions() {
+    use grin_core::core::Transaction;
+    let (mut node, signer, payments, _dir) = crate::node::tests::setup();
+    let first = crate::mining::submission::tests::winning_template(&mut node, &signer, &payments);
+    let submission = json!({"id":2,"method":"submit","params":{
+        "height":first.block.header.height,"job_id":0,"nonce":first.block.header.pow.nonce,
+        "edge_bits":first.block.header.pow.proof.edge_bits,"pow":first.block.header.pow.proof.nonces
+    }});
+    let second =
+        crate::node::tests::prepare_template(&mut node, &signer, &payments, Transaction::empty())
+            .unwrap();
+    let third =
+        crate::node::tests::prepare_template(&mut node, &signer, &payments, Transaction::empty())
+            .unwrap();
+    let mining = Arc::new(
+        Mining::bounded(
+            Arc::new(Mutex::new(node)),
+            Arc::new(signer),
+            Retention::default(),
+        )
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = mining.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    struct Server(Arc<AtomicBool>, Option<thread::JoinHandle<Result<()>>>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            self.1.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    let server = Server(
+        stop,
+        Some(thread::spawn(move || serve(listener, service, signal, 2))),
+    );
+    let client = TcpStream::connect(address).await.unwrap();
+    let (reader, mut writer) = client.into_split();
+    let mut reader = BufReader::new(reader);
+    let request = b"{\"id\":1,\"method\":\"keepalive\"}\n";
+    writer.write_all(request).await.unwrap();
+    async fn receive(reader: &mut (impl AsyncBufRead + Unpin)) -> Value {
+        let line = read_line(reader, tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_slice::<Value>(&line).unwrap()
+    }
+    assert_eq!(receive(&mut reader).await["result"], "ok");
+    let first = mining.publish(first).unwrap();
+    let job = receive(&mut reader).await;
+    assert_eq!(job["method"], "job");
+    assert_eq!(job["params"]["job_id"], first);
+
+    writer.write_all(&request[..12]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = mining.publish(second).unwrap();
+    let job = receive(&mut reader).await;
+    assert_eq!(job["method"], "job");
+    assert_eq!(job["params"]["job_id"], second);
+    writer.write_all(&request[12..]).await.unwrap();
+    let response = receive(&mut reader).await;
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"], "ok");
+
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let (locked, ready) = std::sync::mpsc::sync_channel(1);
+    let node = mining.node.clone();
+    struct BlockedNode(
+        Option<std::sync::mpsc::Sender<()>>,
+        Option<thread::JoinHandle<()>>,
+    );
+    impl Drop for BlockedNode {
+        fn drop(&mut self) {
+            self.0.take();
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let blocked = BlockedNode(
+        Some(release),
+        Some(thread::spawn(move || {
+            let _guard = node.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = wait.recv();
+        })),
+    );
+    ready.recv_timeout(Duration::from_secs(1)).unwrap();
+    write_message(&mut writer, &submission).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while mining.jobs.lock().unwrap().active.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let third = mining.publish(third).unwrap();
+    let job = receive(&mut reader).await;
+    assert_eq!(job["method"], "job");
+    assert_eq!(job["params"]["job_id"], third);
+    drop(blocked);
+    let line = read_line(
+        &mut reader,
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: Value = serde_json::from_slice(&line).unwrap();
+    assert_eq!(response["id"], 2);
+    assert!(response["error"].is_null());
+    assert_eq!(response["g2pool"]["block"], true);
+    writer.write_all(b"{").await.unwrap();
+    let stopped = Instant::now();
+    drop(server);
+    assert!(stopped.elapsed() < Duration::from_secs(1));
+    let mut line = String::new();
+    assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
 }
 
 #[test]

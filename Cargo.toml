@@ -23,7 +23,7 @@ log = { version = "0.4.34", features = ["std"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage"] }
 directories = "6.0.0"
 ctrlc = { version = "3.5.2", features = ["termination"] }
-tokio = { version = "1.53.3", features = ["sync", "macros", "rt", "time"] }
+tokio = { version = "1.53.3", features = ["sync", "macros", "rt", "time", "net", "io-util"] }
 libp2p = { version = "=0.57.1", default-features = false, features = ["tcp", "tokio", "noise", "yamux", "request-response", "ping", "ed25519", "macros", "pnet"] }
 fs2 = "0.4.3"
 grin_chain = "=5.5.2"

@@ -7,14 +7,18 @@ use grin_core::pow::Proof;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    thread,
     time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::watch,
+    task::JoinSet,
 };
 const LINE: usize = 16 * 1024;
 #[derive(Deserialize)]
@@ -69,6 +73,7 @@ pub struct Mining {
     pub node: Arc<Mutex<Node>>,
     pub wallet: Arc<Signer>,
     jobs: Mutex<Jobs>,
+    updates: watch::Sender<()>,
     pub(crate) solutions: crate::mining::submission::Solutions,
 }
 impl Mining {
@@ -103,6 +108,7 @@ impl Mining {
                 active: Default::default(),
                 templates: Leases::new(retention),
             }),
+            updates: watch::channel(()).0,
         })
     }
     pub fn publish(&self, template: Template) -> Result<u64> {
@@ -117,6 +123,7 @@ impl Mining {
             .insert(id, Arc::new(template), bytes, Instant::now())?;
         jobs.next = next;
         jobs.current = Some(id);
+        self.updates.send_replace(());
         Ok(id)
     }
     pub fn job(&self) -> Result<Value> {
@@ -253,71 +260,96 @@ pub fn serve(
     max_connections: usize,
 ) -> Result<()> {
     listener.set_nonblocking(true)?;
-    let slots = crate::limits::WorkSlots::new(max_connections);
-    let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
-    let network = mining.network;
-    let mut result = (|| {
-        while !stop.load(Ordering::Acquire) {
-            let mut index = 0;
-            while index < workers.len() {
-                if workers[index].is_finished() {
-                    workers
-                        .swap_remove(index)
-                        .join()
-                        .map_err(|_| Error::Invalid("Stratum worker panicked"))?;
-                } else {
-                    index += 1;
+    grin_core::global::set_local_chain_type(mining.network);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let mut workers = JoinSet::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            let mut result = async {
+                while !stop.load(Ordering::Acquire) {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        Some(worker) = workers.join_next(), if !workers.is_empty() => {
+                            worker.map_err(|_| Error::Invalid("Stratum worker panicked"))?;
+                        },
+                        accepted = listener.accept() => match accepted {
+                            Ok((stream, _)) => {
+                                if workers.len() < max_connections {
+                                    let mining = mining.clone();
+                                    workers.spawn(async move {
+                                        let _ = connection(stream, &mining).await;
+                                    });
+                                }
+                            },
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                            Err(error) => return Err(error.into()),
+                        },
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            stop.store(true, Ordering::Release);
+            workers.abort_all();
+            while let Some(worker) = workers.join_next().await {
+                if worker.is_err_and(|error| error.is_panic()) && result.is_ok() {
+                    result = Err(Error::Invalid("Stratum worker panicked"));
                 }
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let Some(permit) = slots.acquire() else {
-                        continue;
-                    };
-                    let mining = mining.clone();
-                    let stop = stop.clone();
-                    workers.push(thread::spawn(move || {
-                        let _permit = permit;
-                        grin_core::global::set_local_chain_type(network);
-                        let _ = connection(stream, &mining, &stop);
-                    }));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(25))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    })();
-    stop.store(true, Ordering::Release);
-    for worker in workers {
-        if worker.join().is_err() && result.is_ok() {
-            result = Err(Error::Invalid("Stratum worker panicked"));
+            result
+        })
+}
+async fn write_message(writer: &mut (impl AsyncWrite + Unpin), message: &Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec(message)?;
+    bytes.push(b'\n');
+    tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes))
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    Ok(())
+}
+async fn send_job(
+    writer: &mut (impl AsyncWrite + Unpin),
+    mining: &Mining,
+    updates: &mut watch::Receiver<()>,
+    last_job: &mut Option<u64>,
+) -> Result<()> {
+    updates.borrow_and_update();
+    if let Ok(job) = mining.job() {
+        let id = job["job_id"].as_u64();
+        if id != *last_job {
+            write_message(
+                writer,
+                &json!({"id":"Stratum","jsonrpc":"2.0","method":"job","params":job}),
+            )
+            .await?;
+            *last_job = id;
         }
     }
-    result
+    Ok(())
 }
-fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+async fn connection(stream: TcpStream, mining: &Arc<Mining>) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let mut updates = mining.updates.subscribe();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let mut last_job = None;
-    while !stop.load(Ordering::Acquire) {
-        if let Ok(job) = mining.job() {
-            let id = job["job_id"].as_u64();
-            if id != last_job {
-                serde_json::to_writer(
-                    &mut stream,
-                    &json!({"id":"Stratum","jsonrpc":"2.0","method":"job","params":job}),
-                )?;
-                stream.write_all(b"\n")?;
-                last_job = id;
+    loop {
+        let read = read_line(
+            &mut reader,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(read);
+        let line = loop {
+            send_job(&mut writer, mining, &mut updates, &mut last_job).await?;
+            tokio::select! {
+                line = &mut read => break line?,
+                _ = updates.changed() => {},
             }
-        }
-        let Some(line) = read_line(&mut reader, stop, Instant::now() + Duration::from_secs(5))?
-        else {
+        };
+        let Some(line) = line else {
             return Ok(());
         };
         if line.is_empty() {
@@ -326,7 +358,25 @@ fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Resu
         let request: Value = serde_json::from_slice(&line)?;
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request.get("method").cloned().unwrap_or(Value::Null);
-        let response = match mining.handle(&request) {
+        let result = if method == "submit" {
+            let service = mining.clone();
+            let mut submission = tokio::task::spawn_blocking(move || {
+                grin_core::global::set_local_chain_type(service.network);
+                service.handle(&request)
+            });
+            loop {
+                tokio::select! {
+                    result = &mut submission => break result
+                        .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic())),
+                    _ = updates.changed() => {
+                        send_job(&mut writer, mining, &mut updates, &mut last_job).await?;
+                    },
+                }
+            }
+        } else {
+            mining.handle(&request)
+        };
+        let response = match result {
             Ok(result) => {
                 if method == "submit" {
                     let wire_result = if result["block"] == true {
@@ -346,37 +396,22 @@ fn connection(mut stream: TcpStream, mining: &Mining, stop: &AtomicBool) -> Resu
                 json!({"jsonrpc":"2.0","id":id,"method":method,"result":null,"error":{"code":-32000,"message":error.to_string()}})
             }
         };
-        serde_json::to_writer(&mut stream, &response)?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
+        write_message(&mut writer, &response).await?;
     }
-    Ok(())
 }
 
-fn read_line(
-    reader: &mut BufReader<TcpStream>,
-    stop: &AtomicBool,
-    deadline: Instant,
+async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    deadline: tokio::time::Instant,
 ) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
-        if stop.load(Ordering::Acquire) {
-            return Ok(None);
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero());
-        let Some(remaining) = remaining else {
-            return if line.is_empty() {
-                Ok(Some(line))
-            } else {
-                Err(Error::Capacity("partial Stratum line"))
-            };
-        };
-        reader.get_mut().set_read_timeout(Some(remaining))?;
-        match reader.fill_buf() {
-            Ok([]) => return Ok(None),
-            Ok(bytes) => {
+        match tokio::time::timeout_at(deadline, reader.fill_buf()).await {
+            Ok(Ok([])) => return Ok(None),
+            Ok(Ok(bytes)) => {
                 let take = bytes
                     .iter()
                     .position(|byte| *byte == b'\n')
@@ -391,20 +426,14 @@ fn read_line(
                     return Ok(Some(line));
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return if line.is_empty() {
-                    Ok(Some(line))
-                } else {
-                    Err(Error::Capacity("partial Stratum line"))
-                };
-            }
-            Err(error) => return Err(error.into()),
+            Err(_) => break,
+            Ok(Err(error)) => return Err(error.into()),
         }
+    }
+    if line.is_empty() {
+        Ok(Some(line))
+    } else {
+        Err(Error::Capacity("partial Stratum line"))
     }
 }
 
