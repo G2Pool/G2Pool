@@ -11,7 +11,7 @@ use trace::Trace;
 
 use crate::{
     codec::*,
-    limits::{Budget, Cost, Limits},
+    limits::{Budget, Limits},
     native::{self, View, Work},
     objects::{Key, Kind, Source, StoredObject},
     Error, Result,

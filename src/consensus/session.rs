@@ -1,6 +1,7 @@
 use super::*;
 
 pub enum EvaluationProgress {
+    Known,
     Pending,
     Missing(Key),
     Ready(Box<Evaluation>),
@@ -26,6 +27,7 @@ pub struct Session {
     acquired: BTreeSet<Key>,
     required_traces: BTreeMap<usize, Arc<Trace>>,
     history: BTreeMap<Id, (usize, usize)>,
+    progress: u64,
 }
 impl Session {
     pub fn new(tip: Id, anchor: Anchor, pool_id: Id) -> Self {
@@ -49,6 +51,7 @@ impl Session {
             acquired: BTreeSet::new(),
             required_traces: BTreeMap::new(),
             history: BTreeMap::new(),
+            progress: 0,
         }
     }
     pub(crate) fn seed(&mut self, facts: &Facts) {
@@ -107,6 +110,9 @@ impl Session {
     pub(crate) fn facts(&self) -> Facts {
         self.facts.clone()
     }
+    pub(crate) fn tip_anchor(&self) -> Option<&Anchor> {
+        self.facts.work(self.tip).map(|work| &work.job().anchor)
+    }
     pub(crate) fn acquired(&mut self) -> BTreeSet<Key> {
         std::mem::take(&mut self.acquired)
     }
@@ -147,8 +153,8 @@ impl Session {
         }
         Ok(witnesses)
     }
-    pub fn cost(&self) -> Cost {
-        self.budget.as_ref().map_or(Cost::default(), |b| b.cost)
+    pub(crate) fn progress(&self) -> u64 {
+        self.progress
     }
     pub fn poll<S: Source>(
         &mut self,
@@ -180,7 +186,26 @@ impl Session {
             history: std::mem::take(&mut self.history),
         };
         validator.budget.resume();
+        let before = (
+            self.cursor,
+            self.ranked,
+            self.ledger.frames.len(),
+            self.pending.len(),
+        );
+        let queries = validator.budget.cost.native_queries;
         let outcome = self.advance(&mut validator, quantum.max(1));
+        if !validator.acquired.is_empty()
+            || validator.budget.cost.native_queries != queries
+            || before
+                != (
+                    self.cursor,
+                    self.ranked,
+                    self.ledger.frames.len(),
+                    self.pending.len(),
+                )
+        {
+            self.progress = self.progress.saturating_add(1);
+        }
         self.budget = Some(validator.budget);
         self.required = validator.required;
         self.facts = validator.facts;

@@ -409,6 +409,16 @@ fn run_node(
         }
         if Instant::now() >= recovery_retry {
             let result = (|| -> Result<()> {
+                let critical = node
+                    .lock()
+                    .map_err(|_| Error::Invalid("node poisoned"))?
+                    .critical
+                    .clone();
+                let _critical = match critical.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+                    Err(_) => return Err(Error::Invalid("critical validation poisoned")),
+                };
                 let recovery = node
                     .lock()
                     .map_err(|_| Error::Invalid("node poisoned"))?

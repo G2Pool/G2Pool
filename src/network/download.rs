@@ -37,9 +37,10 @@ impl Default for Downloads {
         }
     }
 }
-pub(super) struct Lease {
+pub(crate) struct Lease {
     shared: Arc<Mutex<Downloads>>,
     keys: Vec<Key>,
+    pub(crate) owner: Option<Arc<()>>,
 }
 impl Downloads {
     pub(super) fn assemble(
@@ -117,7 +118,7 @@ impl Downloads {
         }
         Ok(assembled)
     }
-    pub(super) fn reserve(
+    pub(crate) fn reserve(
         shared: &Arc<Mutex<Self>>,
         address: SocketAddr,
         keys: Vec<Key>,
@@ -138,6 +139,7 @@ impl Downloads {
         Some(Lease {
             shared: shared.clone(),
             keys,
+            owner: None,
         })
     }
 }

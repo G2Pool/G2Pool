@@ -194,7 +194,7 @@ fn share_at(
         let turn = node.take_turn(id).unwrap().unwrap();
         let (turn, outcome) = turn.run();
         match node.finish_turn(turn, outcome).unwrap() {
-            EvaluationProgress::Ready(_) => break,
+            EvaluationProgress::Known | EvaluationProgress::Ready(_) => break,
             EvaluationProgress::Pending => {}
             EvaluationProgress::Missing(key) => panic!("missing {key:?}"),
         }
@@ -229,7 +229,10 @@ fn fetch_missing(source: &Node, target: &mut Node, tip: Id, key: Key) {
     } else {
         vec![key]
     };
-    target.protect_download(tip, &keys).unwrap();
+    let _request = target
+        .reserve_download(tip, "127.0.0.1:3417".parse().unwrap(), keys.clone(), None)
+        .unwrap()
+        .unwrap();
     let objects = keys
         .into_iter()
         .map(|key| Object::new(key, source.store.read(key).unwrap()).unwrap())
@@ -243,6 +246,7 @@ fn acquire(source: &Node, target: &mut Node, tip: Id) -> Evaluation {
         let turn = target.take_turn(tip).unwrap().unwrap();
         let (turn, outcome) = turn.run();
         match target.finish_turn(turn, outcome).unwrap() {
+            EvaluationProgress::Known => return target.evaluate_cached(tip).unwrap().0,
             EvaluationProgress::Ready(result) => return *result,
             EvaluationProgress::Pending => {}
             EvaluationProgress::Missing(key) => fetch_missing(source, target, tip, key),
@@ -426,6 +430,7 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
         let turn = target.take_turn(tip).unwrap().unwrap();
         let (turn, outcome) = turn.run();
         match target.finish_turn(turn, outcome).unwrap() {
+            EvaluationProgress::Known => panic!("bootstrap already completed"),
             EvaluationProgress::Ready(result) => {
                 assert_eq!(result.primary.len(), source.profile.work_window_limit());
                 break;
@@ -551,7 +556,9 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
                 fetch_missing(&source, &mut target, child, key);
             }
             EvaluationProgress::Pending => {}
-            EvaluationProgress::Ready(_) => panic!("child was published before the reorg"),
+            EvaluationProgress::Known | EvaluationProgress::Ready(_) => {
+                panic!("child was published before the reorg")
+            }
         }
         if target.tasks[&child].session.facts().work(child).is_some() {
             break target.take_turn(child).unwrap().unwrap().run();
@@ -570,8 +577,8 @@ fn pruned_branch_bootstraps_across_native_extension_and_restart() {
         .unwrap();
     reorg(&source, &parent);
     assert!(matches!(
-        target.finish_turn(inflight.0, inflight.1).unwrap(),
-        EvaluationProgress::Pending
+        target.finish_turn(inflight.0, inflight.1),
+        Err(Error::View)
     ));
     recover(&mut target);
     assert_eq!(target.parent().unwrap(), Parent::Receipt(tip));
@@ -1219,7 +1226,154 @@ fn interrupted_acquisitions_release_their_slots() {
 }
 
 #[test]
-fn late_download_protection_cannot_restart_a_completed_acquisition() {
+fn stalled_headers_cannot_fence_local_accounting_or_recovery() {
+    use crate::storage::sharechain::MAX_ACQUISITIONS;
+    let (mut node, signer, payments, _dir) = setup();
+    let template =
+        crate::mining::submission::tests::winning_template(&mut node, &signer, &payments);
+    let mut stalled = Vec::new();
+    for n in 1..MAX_ACQUISITIONS {
+        let mut job = template.job.clone();
+        job.parent = Parent::Receipt([n as u8; 32]);
+        let mut header = template.block.header.clone();
+        header.total_kernel_offset =
+            grin_keychain::BlindingFactor::from_slice(&scalar(id(&job).unwrap()).unwrap());
+        pow::pow_size(
+            &mut header,
+            Difficulty::from_num(job.difficulty),
+            global::proofsize(),
+            global::min_edge_bits(),
+        )
+        .unwrap();
+        let bytes = crate::native::native_bytes(&header).unwrap();
+        let tip = hash("WORK_ID", &bytes);
+        let checked = node
+            .prepare_stage(vec![
+                Object::new(
+                    Key::new(Kind::Core, tip),
+                    encode(&Core {
+                        header: Blob(bytes),
+                        job: Blob(encode(&job).unwrap()),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+                Object::new(
+                    Key::new(Kind::Authorization, tip),
+                    encode(&signer.authorize(tip).unwrap()).unwrap(),
+                )
+                .unwrap(),
+            ])
+            .unwrap()
+            .run()
+            .unwrap();
+        node.finish_stage(checked).unwrap();
+        let turn = node.take_turn(tip).unwrap().unwrap();
+        let (turn, outcome) = turn.run();
+        assert!(matches!(
+            node.finish_turn(turn, outcome).unwrap(),
+            EvaluationProgress::Missing(_)
+        ));
+        let progress = node.tasks[&tip].session.progress();
+        let missing = node.waiting_for(tip).unwrap().unwrap();
+        assert_eq!(missing, Key::new(Kind::Core, [n as u8; 32]));
+        assert_eq!(node.waiting_for(tip).unwrap(), Some(missing));
+        assert_eq!(node.tasks[&tip].session.progress(), progress);
+        stalled.push(tip);
+    }
+    let address = "127.0.0.1:3417".parse().unwrap();
+    let request = node
+        .reserve_download(
+            stalled[0],
+            address,
+            vec![Key::new(Kind::Core, [1; 32])],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    let replacement = node.take_turn([99; 32]).unwrap().unwrap();
+    let (replacement, outcome) = replacement.run();
+    node.finish_turn(replacement, outcome).unwrap();
+    assert!(node.tasks.contains_key(&stalled[0]));
+    assert!(!node.tasks.contains_key(&stalled[1]));
+    assert!(!node.store.acquisitions().unwrap().contains(&stalled[1]));
+    assert_eq!(
+        node.store.acquisitions().unwrap().len(),
+        MAX_ACQUISITIONS - 1
+    );
+
+    let _first = node.peer_work.acquire().unwrap();
+    let _second = node.peer_work.acquire().unwrap();
+    let solutions = crate::mining::submission::Solutions::new(&node.store);
+    let node = Arc::new(std::sync::Mutex::new(node));
+    let result = solutions
+        .submit(
+            &node,
+            &template,
+            &signer,
+            template.block.header.pow.nonce,
+            template.block.header.pow.proof.clone(),
+        )
+        .unwrap();
+    assert!(result.native_accepted && result.pool_accepted);
+    drop(request);
+    let mut node = node.lock().unwrap();
+    assert!(node.running.is_empty());
+    assert!(node.tasks.values().all(|task| !task.critical));
+    let block = native_block(&node, &node.chain.head_header().unwrap(), 555555);
+    node.chain
+        .process_block(block, grin_chain::Options::MINE)
+        .unwrap();
+    let recovery = node.prepare_recovery().unwrap().unwrap();
+    node.finish_recovery(recovery.run()).unwrap();
+    assert!(node.parent().is_ok());
+}
+
+#[test]
+fn restarted_lease_table_is_replaceable_without_losing_objects() {
+    use crate::storage::sharechain::MAX_ACQUISITIONS;
+    let (mut node, _signer, _payments, dir) = setup();
+    let object = Object::content(&Inventory {
+        owner: [7; 33],
+        rows: List(vec![]),
+    })
+    .unwrap();
+    node.store.stage(std::slice::from_ref(&object)).unwrap();
+    for n in 1..=MAX_ACQUISITIONS {
+        node.store
+            .acquire(
+                [n as u8; 32],
+                &BTreeSet::from([object.key]),
+                node.limits.facts,
+            )
+            .unwrap();
+    }
+    let chain = node.chain.clone();
+    let profile = node.profile.clone();
+    drop(node);
+    let store = Store::open(
+        &dir.path().join("pool"),
+        profile.pool_id,
+        StorageLimits::default(),
+    )
+    .unwrap();
+    let mut node = Node::start(chain, profile, store, Limits::default(), synchronized()).unwrap();
+    let turn = node.take_turn([99; 32]).unwrap().unwrap();
+    let (turn, outcome) = turn.run();
+    node.finish_turn(turn, outcome).unwrap();
+    assert!(node.store.acquisitions().unwrap().len() < MAX_ACQUISITIONS);
+    assert!(node.store.read(object.key).is_ok());
+    let owner = node.tasks[&[99; 32]].owner.clone();
+    let leases = node.store.acquisitions().unwrap();
+    node.limits.facts = 0;
+    let keys = BTreeSet::from([Key::new(Kind::Core, [100; 32])]);
+    assert!(node.protect_with_room([100; 32], &keys, 0, false).is_err());
+    assert_eq!(node.store.acquisitions().unwrap(), leases);
+    assert!(Arc::ptr_eq(&owner, &node.tasks[&[99; 32]].owner));
+}
+
+#[test]
+fn expired_download_cannot_restart_or_attach_to_a_replaced_acquisition() {
     let (mut source, signer, payments, dir) = setup();
     let tip = share(&mut source, &signer, &payments).0;
     let store = Store::open(
@@ -1237,22 +1391,218 @@ fn late_download_protection_cannot_restart_a_completed_acquisition() {
     )
     .unwrap();
     let turn = target.take_turn(tip).unwrap().unwrap();
-    target
-        .protect_download(tip, &[Key::new(Kind::Core, tip)])
+    let address = "127.0.0.1:3417".parse().unwrap();
+    let request = target
+        .reserve_download(tip, address, vec![Key::new(Kind::Core, tip)], None)
+        .unwrap()
         .unwrap();
     let (turn, outcome) = turn.run();
-    let missing = match target.finish_turn(turn, outcome).unwrap() {
-        EvaluationProgress::Missing(key) => key,
+    match target.finish_turn(turn, outcome).unwrap() {
+        EvaluationProgress::Missing(_) => {}
         _ => panic!("expected missing share data"),
-    };
+    }
+    for kind in [Kind::Core, Kind::Authorization] {
+        let key = Key::new(kind, tip);
+        target
+            .store
+            .stage(&[Object::new(key, source.store.read(key).unwrap()).unwrap()])
+            .unwrap();
+    }
+    let resumed = target.take_turn(tip).unwrap().unwrap();
+    let (resumed, outcome) = resumed.run();
+    assert!(
+        matches!(target.finish_turn(resumed, outcome).unwrap(), EvaluationProgress::Missing(key) if key.kind == Kind::Registration)
+    );
+    target.tasks.get_mut(&tip).unwrap().deadline = 0;
+    target.release_abandoned().unwrap();
+    let material: Vec<_> = source
+        .evaluate_cached(tip)
+        .unwrap()
+        .0
+        .required
+        .into_iter()
+        .map(|key| Object::new(key, source.store.read(key).unwrap()).unwrap())
+        .collect();
+    target.store.stage(&material).unwrap();
+    let replacement = target.take_turn(tip).unwrap().unwrap();
+    let missing = Key::new(Kind::Inventory, [42; 32]);
+    assert!(matches!(
+        target.reserve_download(tip, address, vec![missing], Some(&request)),
+        Err(Error::Cancelled)
+    ));
+    drop(replacement);
+    target.release_abandoned().unwrap();
+    drop(request);
     acquire(&source, &mut target, tip);
-    assert!(target.advertised_heads().unwrap().contains(&tip));
+    assert!(target.published.read().unwrap().heads.contains(&tip));
     assert!(target.tasks.is_empty() && target.running.is_empty());
     assert!(matches!(
-        target.protect_download(tip, &[missing]),
+        target.reserve_download(tip, address, vec![missing], None),
         Err(Error::Cancelled)
     ));
     assert!(target.acquisition_heads().unwrap().is_empty());
+}
+
+#[test]
+fn publication_releases_satisfied_acquisitions_and_preserves_competing_work() {
+    let (mut source, signer, payments, dir) = setup();
+    let ancestor = share(&mut source, &signer, &payments).0;
+    let intermediate = share(&mut source, &signer, &payments).0;
+    let descendant = share(&mut source, &signer, &payments).0;
+    let open = |name| {
+        let store = Store::open(
+            &dir.path().join(name),
+            source.profile.pool_id,
+            StorageLimits::default(),
+        )
+        .unwrap();
+        Node::start(
+            source.chain.clone(),
+            source.profile.clone(),
+            store,
+            Limits::default(),
+            synchronized(),
+        )
+        .unwrap()
+    };
+    let mut competing = open("competing");
+    let competitor = share(&mut competing, &signer, &payments).0;
+    let mut target = open("target");
+    for (tip, from) in [
+        (ancestor, &source),
+        (intermediate, &source),
+        (competitor, &competing),
+    ] {
+        for kind in [Kind::Core, Kind::Authorization] {
+            let key = Key::new(kind, tip);
+            target
+                .store
+                .stage(&[Object::new(key, from.store.read(key).unwrap()).unwrap()])
+                .unwrap();
+        }
+        let turn = target.take_turn(tip).unwrap().unwrap();
+        let (turn, outcome) = turn.run();
+        assert!(matches!(
+            target.finish_turn(turn, outcome).unwrap(),
+            EvaluationProgress::Missing(_)
+        ));
+    }
+    let request = target
+        .reserve_download(
+            ancestor,
+            "127.0.0.1:3417".parse().unwrap(),
+            vec![target.tasks[&ancestor].waiting.unwrap()],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    let running = target.take_turn(intermediate).unwrap().unwrap().run();
+    let material: Vec<_> = source
+        .evaluate_cached(descendant)
+        .unwrap()
+        .0
+        .required
+        .into_iter()
+        .map(|key| Object::new(key, source.store.read(key).unwrap()).unwrap())
+        .collect();
+    target.store.stage(&material).unwrap();
+    acquire(&source, &mut target, descendant);
+    assert!(!target.tasks.contains_key(&ancestor));
+    assert!(!target.store.acquisitions().unwrap().contains(&ancestor));
+    assert!(target.tasks.contains_key(&competitor));
+    let revision = target.revision().unwrap();
+    assert!(matches!(
+        target.finish_turn(running.0, running.1).unwrap(),
+        EvaluationProgress::Known
+    ));
+    assert_eq!(target.revision().unwrap(), revision);
+    assert_eq!(
+        target
+            .store
+            .heads()
+            .unwrap()
+            .iter()
+            .map(|head| head.tip)
+            .collect::<Vec<_>>(),
+        vec![descendant]
+    );
+    assert!(!target.store.acquisitions().unwrap().contains(&intermediate));
+    assert!(matches!(
+        target.reserve_download(
+            ancestor,
+            "127.0.0.1:3417".parse().unwrap(),
+            vec![Key::new(Kind::Registration, [42; 32])],
+            Some(&request)
+        ),
+        Err(Error::Cancelled)
+    ));
+    drop(request);
+    let keep = target.collection_keep(&BTreeSet::new()).unwrap();
+    for _ in 0..8 {
+        target
+            .store
+            .collect(&keep, chrono::Utc::now().timestamp() + 1)
+            .unwrap();
+    }
+    for tip in [ancestor, intermediate, descendant, competitor] {
+        assert!(target.store.read(Key::new(Kind::Core, tip)).is_ok());
+    }
+}
+
+#[test]
+fn native_refresh_releases_expired_or_incompatible_waiting_acquisitions() {
+    for reorganize in [false, true] {
+        let (mut source, signer, payments, dir) = setup();
+        let original = source.chain.head_header().unwrap();
+        let block = native_block(&source, &original, 7123);
+        source
+            .chain
+            .process_block(block, grin_chain::Options::MINE)
+            .unwrap();
+        let tip = share(&mut source, &signer, &payments).0;
+        let store = Store::open(
+            &dir.path().join("target"),
+            source.profile.pool_id,
+            StorageLimits::default(),
+        )
+        .unwrap();
+        let mut target = Node::start(
+            source.chain.clone(),
+            source.profile.clone(),
+            store,
+            Limits::default(),
+            synchronized(),
+        )
+        .unwrap();
+        for kind in [Kind::Core, Kind::Authorization] {
+            let key = Key::new(kind, tip);
+            target
+                .store
+                .stage(&[Object::new(key, source.store.read(key).unwrap()).unwrap()])
+                .unwrap();
+        }
+        let turn = target.take_turn(tip).unwrap().unwrap();
+        let (turn, outcome) = turn.run();
+        assert!(matches!(
+            target.finish_turn(turn, outcome).unwrap(),
+            EvaluationProgress::Missing(_)
+        ));
+        if reorganize {
+            reorg(&source, &original);
+        } else {
+            for child in 7124..7127 {
+                let block = native_block(&source, &source.chain.head_header().unwrap(), child);
+                source
+                    .chain
+                    .process_block(block, grin_chain::Options::MINE)
+                    .unwrap();
+            }
+        }
+        target.ensure_view().unwrap();
+        assert!(target.tasks.is_empty());
+        assert!(target.store.acquisitions().unwrap().is_empty());
+        assert!(target.store.read(Key::new(Kind::Core, tip)).is_ok());
+    }
 }
 
 #[test]

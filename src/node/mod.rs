@@ -44,6 +44,7 @@ pub struct Node {
     pub cancel: Arc<AtomicBool>,
     pub(crate) peer_work: Arc<crate::limits::WorkSlots>,
     pub(crate) serve_work: Arc<crate::limits::WorkSlots>,
+    pub(crate) critical: Arc<std::sync::Mutex<()>>,
     best: Option<Id>,
     validated: BTreeSet<Id>,
     tasks: BTreeMap<Id, Acquisition>,
@@ -142,6 +143,7 @@ impl Node {
             cancel: Arc::new(AtomicBool::new(false)),
             peer_work: crate::limits::WorkSlots::new(2),
             serve_work: crate::limits::WorkSlots::new(1),
+            critical: Arc::new(std::sync::Mutex::new(())),
             best: None,
             validated: BTreeSet::new(),
             tasks: BTreeMap::new(),
@@ -156,6 +158,7 @@ impl Node {
         Ok(node)
     }
     pub(crate) fn publish_snapshot(&mut self) -> Result<()> {
+        self.release_obsolete()?;
         let retained: BTreeSet<_> = self
             .store
             .heads()?
@@ -223,21 +226,6 @@ impl Node {
             .best
             .map(Parent::Receipt)
             .unwrap_or(Parent::Root(view.head)))
-    }
-
-    pub fn advertised_heads(&self) -> Result<Vec<Id>> {
-        let head = self.view()?.head;
-        let mut heads: Vec<_> = self
-            .store
-            .heads()?
-            .into_iter()
-            .filter(|candidate| candidate.anchor == head && self.validated.contains(&candidate.tip))
-            .map(|candidate| candidate.tip)
-            .collect();
-        let best = self.best;
-        heads.sort_by_key(|tip| (Some(*tip) != best, *tip));
-        heads.truncate(crate::network::MAX_TIPS);
-        Ok(heads)
     }
 
     pub(crate) fn knows_head(&self, tip: Id) -> bool {
@@ -417,6 +405,7 @@ impl Node {
             .or(self.store.revision()?.and_then(|revision| revision.tip))
             .or_else(|| self.recovery.front().map(|(origin, _)| *origin));
         let head = self.view()?.head;
+        self.release_obsolete()?;
         let view = View::pin(
             &self.chain,
             self.profile.clone(),
@@ -424,6 +413,7 @@ impl Node {
         )?;
         for task in self.tasks.values_mut() {
             task.session.rebase(&view)?;
+            task.waiting = None;
         }
         view.check()?;
         self.rebase_facts(&head)?;

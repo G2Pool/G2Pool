@@ -585,32 +585,44 @@ impl Store {
     }
     pub fn acquisitions(&self) -> Result<Vec<Id>> {
         Ok(self
-            .snapshot()?
-            .leases(9)
-            .map_err(runtime_error)?
+            .acquisition_leases()?
             .into_iter()
-            .filter(|(_, expires, _)| *expires > now())
-            .map(|(tip, _, _)| tip)
+            .filter(|(_, expires)| *expires > now())
+            .map(|(tip, _)| tip)
             .collect())
     }
+    pub(crate) fn acquisition_leases(&self) -> Result<Vec<(Id, u64)>> {
+        self.snapshot()?.lease_metadata().map_err(runtime_error)
+    }
     pub fn acquire(&mut self, tip: Id, keys: &BTreeSet<Key>, max_keys: usize) -> Result<u64> {
+        self.replace_acquisition(tip, keys, max_keys, &[])
+    }
+    pub(crate) fn replace_acquisition(
+        &mut self,
+        tip: Id,
+        keys: &BTreeSet<Key>,
+        max_keys: usize,
+        replaced: &[Id],
+    ) -> Result<u64> {
         self.check_writer()?;
         let now = now();
-        let leases = self.snapshot()?.leases(9).map_err(runtime_error)?;
+        let leases = self.acquisition_leases()?;
         let release: Vec<_> = leases
             .iter()
-            .filter(|(_, expires, _)| *expires <= now)
-            .map(|(id, _, _)| *id)
+            .filter(|(id, expires)| *expires <= now || replaced.contains(id))
+            .map(|(id, _)| *id)
             .collect();
         let retained: Vec<_> = leases
             .iter()
-            .filter(|(id, _, _)| !release.contains(id))
+            .filter(|(id, _)| !release.contains(id))
             .collect();
-        if !retained.iter().any(|(id, _, _)| *id == tip) && retained.len() >= 8 {
+        if !retained.iter().any(|(id, _)| *id == tip)
+            && retained.len() >= sharechain::MAX_ACQUISITIONS
+        {
             return Err(Error::Capacity("acquisition tasks"));
         }
-        let deadline = match retained.iter().find(|(id, _, _)| *id == tip) {
-            Some((_, expires, _)) => *expires,
+        let deadline = match retained.iter().find(|(id, _)| *id == tip) {
+            Some((_, expires)) => *expires,
             None => now
                 .checked_add(sharechain::ACQUISITION_LIFETIME)
                 .ok_or(Error::Capacity("acquisition deadline"))?,

@@ -389,10 +389,25 @@ fn material(template: &Template, wallet: &Signer, block: &Block) -> Result<Vec<O
 }
 
 fn account(node: &Arc<Mutex<Node>>, id: Id, objects: Vec<Object>) -> Result<()> {
+    let critical = node
+        .lock()
+        .map_err(|_| Error::Invalid("node poisoned"))?
+        .critical
+        .clone();
+    let _critical = critical
+        .lock()
+        .map_err(|_| Error::Invalid("critical validation poisoned"))?;
+    let result = account_inner(node, id, objects);
+    node.lock()
+        .map_err(|_| Error::Invalid("node poisoned"))?
+        .release_critical(id)?;
+    result
+}
+fn account_inner(node: &Arc<Mutex<Node>>, id: Id, objects: Vec<Object>) -> Result<()> {
     let stage = {
         let mut guard = node.lock().map_err(|_| Error::Invalid("node poisoned"))?;
         guard.ensure_view()?;
-        guard.prepare_stage(objects)?
+        guard.prepare_local_stage(objects)?
     };
     let checked = stage.run()?;
     node.lock()
@@ -402,9 +417,14 @@ fn account(node: &Arc<Mutex<Node>>, id: Id, objects: Vec<Object>) -> Result<()> 
         let turn = {
             let mut guard = node.lock().map_err(|_| Error::Invalid("node poisoned"))?;
             guard.ensure_view()?;
-            guard
-                .take_turn(id)?
-                .ok_or(Error::Capacity("candidate verification in progress"))?
+            if guard.cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::Cancelled);
+            }
+            guard.take_local_turn(id)?
+        };
+        let Some(turn) = turn else {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
         };
         let (turn, outcome) = turn.run();
         match node
@@ -412,7 +432,8 @@ fn account(node: &Arc<Mutex<Node>>, id: Id, objects: Vec<Object>) -> Result<()> 
             .map_err(|_| Error::Invalid("node poisoned"))?
             .finish_turn(turn, outcome)?
         {
-            crate::consensus::EvaluationProgress::Ready(_) => return Ok(()),
+            crate::consensus::EvaluationProgress::Known
+            | crate::consensus::EvaluationProgress::Ready(_) => return Ok(()),
             crate::consensus::EvaluationProgress::Pending => std::thread::yield_now(),
             crate::consensus::EvaluationProgress::Missing(key) => {
                 return Err(Error::Unavailable(key))

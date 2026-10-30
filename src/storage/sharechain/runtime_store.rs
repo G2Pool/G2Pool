@@ -110,7 +110,6 @@ pub struct RuntimeLease<'a> {
     pub id: Id,
     pub keys: &'a [RoutingKey],
 }
-pub type LeaseInfo = (Id, u64, Vec<RoutingKey>);
 #[derive(Default)]
 pub struct RuntimeBatch<'a> {
     pub objects: &'a [RuntimeObject<'a>],
@@ -168,7 +167,7 @@ fn check_leases(db: Database<Bytes, Bytes>, tx: &RoTxn<'_>, now: u64, max_keys: 
             memberships = memberships
                 .checked_add(((value.len() - 8) / 33) as u64)
                 .ok_or(Error::Invalid("runtime lease membership overflow"))?;
-            if count > 8 || memberships > max_keys {
+            if count > super::MAX_ACQUISITIONS as u64 || memberships > max_keys {
                 return Err(Error::Quota("runtime lease quota"));
             }
         }
@@ -347,8 +346,8 @@ impl RuntimeStore {
         if batch.objects.len() as u64 > max_objects
             || batch.replacements.len() as u64 > self.limits.max_objects
             || batch.seals.len() as u64 > max_objects
-            || batch.leases.len() > 8
-            || batch.release_leases.len() > 8
+            || batch.leases.len() > super::MAX_ACQUISITIONS
+            || batch.release_leases.len() > super::MAX_ACQUISITIONS
             || batch.heads.len() as u64 > self.limits.max_heads
             || batch.release_heads.len() as u64 > self.limits.max_heads
             || batch
@@ -836,8 +835,8 @@ impl RuntimeSnapshot {
     pub fn heads(&self, limit: usize) -> Result<Vec<(Id, Vec<u8>)>> {
         self.read(|reader| reader.heads(limit))
     }
-    pub fn leases(&self, limit: usize) -> Result<Vec<LeaseInfo>> {
-        self.read(|reader| reader.leases(limit))
+    pub fn lease_metadata(&self) -> Result<Vec<(Id, u64)>> {
+        self.read(|reader| reader.lease_metadata())
     }
     #[cfg(test)]
     pub fn objects(&self, kind: u8, limit: usize) -> Result<Vec<(RoutingKey, RuntimeVariant)>> {
@@ -908,27 +907,17 @@ impl RuntimeReader<'_> {
             })
             .collect()
     }
-    pub fn leases(&self, limit: usize) -> Result<Vec<LeaseInfo>> {
+    fn lease_metadata(&self) -> Result<Vec<(Id, u64)>> {
         self.store
             .db
             .prefix_iter(self.txn, b"l")?
-            .take(limit.min(8))
+            .take(super::MAX_ACQUISITIONS)
             .map(|row| {
-                let (k, v) = row?;
-                if k.len() != 33 || v.len() < 8 || (v.len() - 8) % 33 != 0 {
+                let (key, value) = row?;
+                if key.len() != 33 || value.len() < 8 || (value.len() - 8) % 33 != 0 {
                     return Err(Error::Invalid("runtime lease"));
                 }
-                let id: Id = k[1..].try_into().unwrap();
-                Ok((
-                    id,
-                    num(Some(&v[..8]))?,
-                    v[8..]
-                        .as_chunks::<33>()
-                        .0
-                        .iter()
-                        .map(|k| RoutingKey::decode(k))
-                        .collect::<Result<Vec<_>>>()?,
-                ))
+                Ok((key[1..].try_into().unwrap(), num(Some(&value[..8]))?))
             })
             .collect()
     }

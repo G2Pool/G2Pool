@@ -71,6 +71,7 @@ pub struct Client {
     generation: Option<libp2p::swarm::ConnectionId>,
     inbound: Option<libp2p::swarm::ConnectionId>,
     observed_heads: Option<(libp2p::swarm::ConnectionId, Vec<Id>)>,
+    pending: VecDeque<Id>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -87,6 +88,7 @@ impl Client {
             generation: None,
             inbound: None,
             observed_heads: None,
+            pending: VecDeque::new(),
             last_heads: Instant::now() - Duration::from_secs(30),
             next_peers: Instant::now(),
         }
@@ -191,6 +193,7 @@ impl Client {
             if self.generation != packet.origin {
                 self.initialized = false;
                 self.observed_heads = None;
+                self.pending.clear();
                 self.last_heads = Instant::now() - Duration::from_secs(30);
             }
             self.generation = packet.origin;
@@ -198,6 +201,7 @@ impl Client {
         if result.is_err() {
             self.initialized = false;
             self.observed_heads = None;
+            self.pending.clear();
         }
         result
     }
@@ -316,16 +320,26 @@ fn acquire_turns(
     } else {
         vec![]
     };
+    for tip in tips
+        .into_iter()
+        .chain(session.handle.as_ref().unwrap().notices(session.address))
+    {
+        session.pending.retain(|old| *old != tip);
+        session.pending.push_front(tip);
+        session.pending.truncate(MAX_TIPS);
+    }
     let mut queue: VecDeque<_> = lock(node)?
         .acquisition_heads()?
         .into_iter()
-        .chain(tips)
-        .chain(session.handle.as_ref().unwrap().notices(session.address))
+        .chain(session.pending.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let known: BTreeSet<_> = lock(node)?.advertised_heads()?.into_iter().collect();
-    queue.retain(|tip| !known.contains(tip));
+    {
+        let guard = lock(node)?;
+        queue.retain(|tip| !guard.knows_head(*tip));
+        session.pending.retain(|tip| !guard.knows_head(*tip));
+    }
     if let Some(cursor) = lock(node)?.sync_cursor {
         let pivot = queue.iter().take_while(|tip| **tip <= cursor).count();
         queue.rotate_left(pivot);
@@ -342,45 +356,70 @@ fn acquire_turns(
             break;
         }
         turns += 1;
-        let turn = {
+        let missing = {
             let mut guard = lock(node)?;
             guard.sync_cursor = Some(tip);
-            guard.take_turn(tip)?
+            let mut missing = guard.waiting_for(tip)?;
+            if missing.is_none() {
+                for kind in [Kind::Core, Kind::Authorization] {
+                    let key = Key::new(kind, tip);
+                    match guard.store.byte_length(key) {
+                        Ok(_) => {}
+                        Err(Error::Unavailable(_)) => {
+                            missing = Some(key);
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            missing
         };
-        let Some(turn) = turn else {
-            break;
-        };
-        let (turn, outcome) = turn.run();
-        let outcome = lock(node)?.finish_turn(turn, outcome);
-        let missing = match outcome {
-            Ok(EvaluationProgress::Ready(_)) => {
-                admitted += 1;
-                continue;
+        let missing = if let Some(key) = missing {
+            key
+        } else {
+            let turn = lock(node)?.take_turn(tip);
+            let turn = match turn {
+                Ok(Some(turn)) => turn,
+                Ok(None) | Err(Error::Capacity(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let (turn, outcome) = turn.run();
+            let outcome = lock(node)?.finish_turn(turn, outcome);
+            match outcome {
+                Ok(EvaluationProgress::Known) => continue,
+                Ok(EvaluationProgress::Ready(_)) => {
+                    admitted += 1;
+                    continue;
+                }
+                Ok(EvaluationProgress::Pending) => {
+                    queue.push_back(tip);
+                    thread::yield_now();
+                    continue;
+                }
+                Ok(EvaluationProgress::Missing(key)) => key,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(Error::View) => return Err(Error::View),
+                Err(Error::Capacity(_) | Error::EvaluationTime) => {
+                    continue;
+                }
+                Err(Error::Expired) => {
+                    session.pending.retain(|pending| *pending != tip);
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-            Ok(EvaluationProgress::Pending) => {
-                queue.push_back(tip);
-                thread::yield_now();
-                continue;
-            }
-            Ok(EvaluationProgress::Missing(key)) => key,
-            Err(Error::Cancelled) => return Err(Error::Cancelled),
-            Err(Error::View) => return Err(Error::View),
-            Err(Error::Capacity(_) | Error::EvaluationTime) => {
-                queue.push_back(tip);
-                continue;
-            }
-            Err(error) => return Err(error),
         };
         let keys = if missing.kind == Kind::Core {
             vec![missing, Key::new(Kind::Authorization, missing.id)]
         } else {
             vec![missing]
         };
-        lock(node)?.protect_download(tip, &keys)?;
-        let shared = lock(node)?.downloads.clone();
-        let Some(lease) = download::Downloads::reserve(&shared, session.address, keys.clone())
-        else {
-            continue;
+        let lease = lock(node)?.reserve_download(tip, session.address, keys.clone(), None);
+        let lease = match lease {
+            Ok(Some(lease)) => lease,
+            Ok(None) | Err(Error::Cancelled) => continue,
+            Err(error) => return Err(error),
         };
         let packet = session.request(Message::Get(keys.clone()), stop)?;
         let (objects, absent, deferred) = match packet.message() {
@@ -390,16 +429,15 @@ fn acquire_turns(
                 deferred,
             } => (objects, absent, deferred),
             Message::Busy => {
-                queue.push_back(tip);
+                lease.deferred(session.address, &keys);
                 continue;
             }
             _ => return Err(Error::Invalid("object reply")),
         };
         lease.absent(session.address, &absent);
         lease.deferred(session.address, &deferred);
-        stage_partial(node, objects, session.address)?;
+        let progress = stage_partial(node, objects, session.address)?;
         drop(packet);
-        drop(lease);
         if missing.kind == Kind::Inventory {
             let source = lock(node)?.store.read_source()?;
             let source = source.open()?;
@@ -420,13 +458,15 @@ fn acquire_turns(
                 .collect();
             drop(source);
             for keys in batches(&needed)? {
-                lock(node)?.protect_download(tip, &keys)?;
-                let Some(lease) =
-                    download::Downloads::reserve(&shared, session.address, keys.clone())
-                else {
-                    continue;
+                let request =
+                    lock(node)?.reserve_download(tip, session.address, keys.clone(), Some(&lease));
+                let request = match request {
+                    Ok(Some(request)) => request,
+                    Ok(None) => continue,
+                    Err(Error::Cancelled) => break,
+                    Err(error) => return Err(error),
                 };
-                let packet = session.request(Message::Get(keys), stop)?;
+                let packet = session.request(Message::Get(keys.clone()), stop)?;
                 let (objects, absent, deferred) = match packet.message() {
                     Message::Reply {
                         objects,
@@ -434,12 +474,13 @@ fn acquire_turns(
                         deferred,
                     } => (objects, absent, deferred),
                     Message::Busy => {
+                        request.deferred(session.address, &keys);
                         break;
                     }
                     _ => return Err(Error::Invalid("object reply")),
                 };
-                lease.absent(session.address, &absent);
-                lease.deferred(session.address, &deferred);
+                request.absent(session.address, &absent);
+                request.deferred(session.address, &deferred);
                 let progress = !objects.is_empty();
                 if progress {
                     stage(node, objects)?;
@@ -449,7 +490,10 @@ fn acquire_turns(
                 }
             }
         }
-        queue.push_back(tip);
+        drop(lease);
+        if progress {
+            queue.push_back(tip);
+        }
     }
     Ok(admitted)
 }

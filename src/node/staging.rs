@@ -4,7 +4,7 @@ use std::cell::RefCell;
 
 pub(crate) struct Stage {
     source: ReadSource,
-    _permit: crate::limits::WorkPermit,
+    _permit: Option<crate::limits::WorkPermit>,
     chain: Arc<Chain>,
     profile: Profile,
     anchor: Anchor,
@@ -117,6 +117,20 @@ impl Stage {
 
 impl Node {
     pub(crate) fn prepare_stage(&self, objects: Vec<Object>) -> Result<Stage> {
+        let permit = self
+            .peer_work
+            .acquire()
+            .ok_or(Error::Capacity("peer native work slots"))?;
+        self.prepare_stage_inner(objects, Some(permit))
+    }
+    pub(crate) fn prepare_local_stage(&self, objects: Vec<Object>) -> Result<Stage> {
+        self.prepare_stage_inner(objects, None)
+    }
+    fn prepare_stage_inner(
+        &self,
+        objects: Vec<Object>,
+        permit: Option<crate::limits::WorkPermit>,
+    ) -> Result<Stage> {
         if self.native_sync.is_syncing() {
             return Err(Error::NativeUnavailable(
                 "Grin node is synchronizing".into(),
@@ -125,11 +139,6 @@ impl Node {
         if objects.len() > crate::network::REQUEST_KEYS {
             return Err(Error::Capacity("peer staging package"));
         }
-        let permit = self
-            .peer_work
-            .acquire()
-            .ok_or(Error::Capacity("peer native work slots"))?;
-
         package_bytes(&objects)?;
         Ok(Stage {
             _permit: permit,

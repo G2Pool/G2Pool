@@ -15,6 +15,7 @@ pub(crate) use runtime_store::{
 use std::path::Path;
 
 pub(crate) const ACQUISITION_LIFETIME: u64 = 900;
+pub(crate) const MAX_ACQUISITIONS: usize = 8;
 pub(crate) const STORAGE_FORMAT: u32 = 1;
 pub const MIN_MAP_BYTES: usize = 1 << 30;
 pub type Id = [u8; 32];

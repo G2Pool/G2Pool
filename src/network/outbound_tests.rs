@@ -178,8 +178,10 @@ fn full_outbound_set_survives_busy_candidates_then_rotates_after_valid_state_exc
     wait_until(|| connections.transport.connected.load(Ordering::Acquire) == OUTBOUND_PEERS);
     assert!(lock(&left)
         .unwrap()
-        .advertised_heads()
+        .published
+        .read()
         .unwrap()
+        .heads
         .contains(&tip));
     let eligible = lock(&left).unwrap().peers.targets(
         chrono::Utc::now().timestamp(),
@@ -289,7 +291,7 @@ fn valid_ancestor_and_empty_state_qualify_but_unknown_history_does_not() {
     assert_ne!(ancestor, descendant);
     assert!(lock(&left).unwrap().knows_head(ancestor));
     assert_eq!(
-        lock(&left).unwrap().advertised_heads().unwrap(),
+        lock(&left).unwrap().published.read().unwrap().heads,
         vec![descendant]
     );
     assert!(client.verified_connection(&left).unwrap().is_some());
@@ -370,4 +372,51 @@ fn inbound_and_outbound_sessions_exchange_shares_over_one_connection() {
         incoming.inbound.is_empty()
     });
     assert!(incoming.transport.inbound.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unknown_hints_allocate_no_session_and_missing_material_can_come_from_another_peer() {
+    use crate::objects::{Key, Kind, Source};
+    let (left, _left_keys, _left_wallet, _left_dir) = crate::node::tests::setup();
+    let (mut partial, _partial_keys, _partial_wallet, _partial_dir) = crate::node::tests::setup();
+    let (mut complete, signer, payments, _complete_dir) = crate::node::tests::setup();
+    let (tip, template) = crate::node::tests::share(&mut complete, &signer, &payments);
+    for kind in [Kind::Core, Kind::Authorization] {
+        let key = Key::new(kind, tip);
+        partial
+            .store
+            .stage(&[crate::storage::Object::new(key, complete.store.read(key).unwrap()).unwrap()])
+            .unwrap();
+    }
+    partial.published.write().unwrap().heads = vec![[99; 32]];
+    let pool_id = left.profile.pool_id;
+    let left = Arc::new(Mutex::new(left));
+    let partial = Arc::new(Mutex::new(partial));
+    let mut servers = Servers::new();
+    servers.start(left.clone(), [127, 0, 0, 1]);
+    let partial_address = servers.start(partial.clone(), [127, 60, 0, 1]);
+    let complete_address = servers.start(Arc::new(Mutex::new(complete)), [127, 61, 0, 1]);
+    let mut first = Client::new(partial_address, pool_id);
+    assert_eq!(first.synchronize(&left, &servers.stop).unwrap(), 0);
+    assert!(lock(&left).unwrap().acquisition_heads().unwrap().is_empty());
+    partial.lock().unwrap().published.write().unwrap().heads = vec![tip];
+    first.last_heads = Instant::now() - Duration::from_secs(30);
+    assert_eq!(first.synchronize(&left, &servers.stop).unwrap(), 0);
+    let missing = Key::new(Kind::Registration, template.job.registration);
+    assert_eq!(
+        lock(&left).unwrap().waiting_for(tip).unwrap(),
+        Some(missing)
+    );
+    let generation = first.generation;
+    assert_eq!(first.synchronize(&left, &servers.stop).unwrap(), 0);
+    assert_eq!(first.generation, generation);
+    let mut second = Client::new(complete_address, pool_id);
+    wait_until(|| {
+        second.synchronize(&left, &servers.stop).unwrap();
+        lock(&left).unwrap().knows_head(tip)
+    });
+    assert_eq!(
+        lock(&left).unwrap().published.read().unwrap().heads,
+        vec![tip]
+    );
 }

@@ -72,7 +72,7 @@ fn key(n: u64) -> RoutingKey {
 fn apply(db: &Fixture, batch: &DependencyBatch<'_>) -> Result<()> {
     let mut tx = db.env.write_txn()?;
     db.dependencies.apply(&mut tx, batch)?;
-    db.dependencies.drain_gc(&mut tx, usize::MAX)?;
+    while db.dependencies.drain_gc(&mut tx, usize::MAX)?.pending_nodes != 0 {}
     tx.commit()?;
     Ok(())
 }
